@@ -1,0 +1,38 @@
+# PyTorch and related libraries
+torch>=1.12.0
+torchvision>=0.13.0
+torchaudio>=0.12.0
+
+# Computer Vision
+opencv-python>=4.6.0
+Pillow>=9.0.0
+
+# Scientific Computing
+numpy>=1.21.0
+scipy>=1.8.0
+
+# Machine Learning
+scikit-learn>=1.1.0
+
+# Data Manipulation
+pandas>=1.4.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Progress bars
+tqdm>=4.64.0
+
+# Tensorboard for logging
+tensorboard>=2.8.0
+
+# Configuration
+PyYAML>=6.0
+
+# Audio processing (if needed for alignment files)
+librosa>=0.9.0
+
+# Optional: for better performance
+# CUDA toolkit (install separately)
+# cuDNN (install separately)

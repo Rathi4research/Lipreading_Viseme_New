@@ -1,0 +1,19 @@
+venv/
+__pycache__/
+*.pyc
+
+# Large model/data artifacts
+checkpoints/
+runs/
+plots/
+results/
+data/
+*.dat
+*.whl
+
+# Logs
+*.log
+
+# IDE / OS
+.idea/
+.DS_Store
