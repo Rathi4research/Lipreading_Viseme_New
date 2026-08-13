@@ -1,4 +1,5 @@
 import os
+import logging
 import torch
 import cv2
 import numpy as np
@@ -6,6 +7,49 @@ import dlib
 from torch.utils.data import Dataset, DataLoader
 from src.config import Config
 from src.viseme_mapping import viseme_mapper
+
+logger = logging.getLogger(__name__)
+
+# GRID's .align files label each interval with a whole word (or 'sil'/'sp'), not a
+# phoneme. Config.PHONEMES/viseme_mapper only understand phonemes, so each word in the
+# closed GRID vocabulary is expanded to its phone sequence (TIMIT-style, matching
+# Config.PHONEMES) before phoneme/viseme label lookup. Without this, every word silently
+# missed the phoneme lookup and defaulted to 'sil'/silence-viseme, collapsing nearly all
+# labels to a single class.
+GRID_WORD_TO_PHONEMES = {
+    'sil': ['sil'],
+    # Commands
+    'bin': ['b', 'ih', 'n'],
+    'lay': ['l', 'ey'],
+    'place': ['p', 'l', 'ey', 's'],
+    'set': ['s', 'eh', 't'],
+    # Colors
+    'blue': ['b', 'l', 'uw'],
+    'green': ['g', 'r', 'iy', 'n'],
+    'red': ['r', 'eh', 'd'],
+    'white': ['w', 'ay', 't'],
+    # Prepositions
+    'at': ['ae', 't'],
+    'by': ['b', 'ay'],
+    'in': ['ih', 'n'],
+    'with': ['w', 'ih', 'th'],
+    # Letters (a-z, excluding 'w')
+    'a': ['ey'], 'b': ['b', 'iy'], 'c': ['s', 'iy'], 'd': ['d', 'iy'],
+    'e': ['iy'], 'f': ['eh', 'f'], 'g': ['jh', 'iy'], 'h': ['ey', 'ch'],
+    'i': ['ay'], 'j': ['jh', 'ey'], 'k': ['k', 'ey'], 'l': ['eh', 'l'],
+    'm': ['eh', 'm'], 'n': ['eh', 'n'], 'o': ['ow'], 'p': ['p', 'iy'],
+    'q': ['k', 'y', 'uw'], 'r': ['aa', 'r'], 's': ['eh', 's'], 't': ['t', 'iy'],
+    'u': ['y', 'uw'], 'v': ['v', 'iy'], 'x': ['eh', 'k', 's'], 'y': ['w', 'ay'],
+    'z': ['z', 'eh', 'd'],
+    # Digits
+    'zero': ['z', 'iy', 'r', 'ow'], 'one': ['w', 'ah', 'n'], 'two': ['t', 'uw'],
+    'three': ['th', 'r', 'iy'], 'four': ['f', 'ao', 'r'], 'five': ['f', 'ay', 'v'],
+    'six': ['s', 'ih', 'k', 's'], 'seven': ['s', 'eh', 'v', 'ax', 'n'],
+    'eight': ['ey', 't'], 'nine': ['n', 'ay', 'n'],
+    # Adverbs
+    'again': ['ax', 'g', 'eh', 'n'], 'now': ['n', 'aw'],
+    'please': ['p', 'l', 'iy', 'z'], 'soon': ['s', 'uw', 'n'],
+}
 
 
 class GRIDDataset(Dataset):
@@ -122,9 +166,17 @@ class GRIDDataset(Dataset):
         return frames
 
     def load_alignment(self, align_path):
-        """Load alignment file and extract phoneme sequence"""
-        phonemes = []
-        words = []
+        """Build a per-frame phoneme/viseme sequence aligned to the video's frame grid.
+
+        GRID .align timestamps are given in units of 1/25000 sec; dividing by 1000
+        converts them to a frame index at the corpus's native 25 fps (Config.TARGET_FPS,
+        matching Config.SEQUENCE_LENGTH=75 for ~3s clips). Each word interval is mapped to
+        its covered frame range, and the word's phones (see GRID_WORD_TO_PHONEMES) are
+        spread evenly across that range, so frame t's label is the phone actually being
+        spoken at that instant rather than a position in a word-count-length list that had
+        no relation to the video's actual timing.
+        """
+        intervals = []  # (start_frame, end_frame, word_label)
 
         with open(align_path, 'r') as f:
             for line in f.readlines():
@@ -134,25 +186,36 @@ class GRIDDataset(Dataset):
                     if len(parts) >= 3:
                         label = parts[2]
                         if label != 'sp':  # skip pauses
-                            phonemes.append(label)
-                            if label in Config.VOCABULARY:
-                                words.append(label)
+                            start_frame = int(parts[0]) // 1000
+                            end_frame = int(parts[1]) // 1000
+                            intervals.append((start_frame, end_frame, label))
 
-        # Convert phonemes to indices
+        words = [label for _, _, label in intervals if label in Config.VOCABULARY]
+
+        num_frames = Config.SEQUENCE_LENGTH
+        frame_phonemes = ['sil'] * num_frames
+
+        for start_frame, end_frame, label in intervals:
+            word_phones = GRID_WORD_TO_PHONEMES.get(label)
+            if word_phones is None:
+                logger.warning(
+                    f"No pronunciation for word '{label}' in {align_path}; "
+                    f"treating as silence"
+                )
+                word_phones = ['sil']
+
+            span = max(end_frame - start_frame, 1)
+            for t in range(max(start_frame, 0), min(end_frame, num_frames)):
+                phone_idx = min(int((t - start_frame) / span * len(word_phones)),
+                                 len(word_phones) - 1)
+                frame_phonemes[t] = word_phones[phone_idx]
+
+        # Convert per-frame phonemes to indices
         phoneme_to_idx = {p: i for i, p in enumerate(Config.PHONEMES)}
-        phoneme_indices = [phoneme_to_idx.get(p, 0) for p in phonemes]
+        phoneme_indices = [phoneme_to_idx.get(p, 0) for p in frame_phonemes]
 
         # Convert to visemes
-        viseme_indices = viseme_mapper.phoneme_to_viseme_sequence(phonemes)
-
-        # Pad/truncate
-        if len(phoneme_indices) > Config.SEQUENCE_LENGTH:
-            phoneme_indices = phoneme_indices[:Config.SEQUENCE_LENGTH]
-            viseme_indices = viseme_indices[:Config.SEQUENCE_LENGTH]
-        else:
-            padding_length = Config.SEQUENCE_LENGTH - len(phoneme_indices)
-            phoneme_indices.extend([0] * padding_length)  # silence
-            viseme_indices.extend([11] * padding_length)  # silence viseme
+        viseme_indices = viseme_mapper.phoneme_to_viseme_sequence(frame_phonemes)
 
         return phoneme_indices, words, viseme_indices
 

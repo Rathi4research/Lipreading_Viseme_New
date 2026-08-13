@@ -155,9 +155,19 @@ class LipReadingEvaluator:
         viseme_cm = confusion_matrix(all_viseme_targets, all_viseme_preds)
         phoneme_cm = confusion_matrix(all_phoneme_targets, all_phoneme_preds)
 
-        # Calculate per-class accuracies
-        viseme_per_class_acc = viseme_cm.diagonal() / viseme_cm.sum(axis=1)
-        phoneme_per_class_acc = phoneme_cm.diagonal() / phoneme_cm.sum(axis=1)
+        # Calculate per-class accuracies. A row sum of 0 means that class never appeared
+        # in the targets, so accuracy is undefined (not 0) — leave those classes as nan
+        # and exclude them from aggregates like min/max instead of dividing by zero.
+        viseme_row_sums = viseme_cm.sum(axis=1)
+        viseme_per_class_acc = np.divide(
+            viseme_cm.diagonal(), viseme_row_sums,
+            out=np.full(viseme_row_sums.shape, np.nan), where=viseme_row_sums != 0
+        )
+        phoneme_row_sums = phoneme_cm.sum(axis=1)
+        phoneme_per_class_acc = np.divide(
+            phoneme_cm.diagonal(), phoneme_row_sums,
+            out=np.full(phoneme_row_sums.shape, np.nan), where=phoneme_row_sums != 0
+        )
 
         results = {
             'accuracy_metrics': {
@@ -222,8 +232,14 @@ class LipReadingEvaluator:
         # Create figure
         fig, ax = plt.subplots(figsize=figsize)
 
-        # Normalize confusion matrix for better visualization
-        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        # Normalize confusion matrix for better visualization. Rows with zero true
+        # samples have no meaningful frequency distribution, so leave them as 0 rather
+        # than dividing by zero.
+        row_sums = cm.sum(axis=1)[:, np.newaxis]
+        cm_normalized = np.divide(
+            cm.astype('float'), row_sums,
+            out=np.zeros_like(cm, dtype=float), where=row_sums != 0
+        )
 
         # Plot heatmap
         sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='YlOrRd',
@@ -429,10 +445,10 @@ class LipReadingEvaluator:
             report_lines.append(f"Phoneme Classes: {p_cm.shape[0]}")
             report_lines.append("")
             report_lines.append("Per-Class Performance:")
-            report_lines.append(f"  Viseme - Worst class accuracy: {v_per_class.min():.4f}")
-            report_lines.append(f"  Viseme - Best class accuracy: {v_per_class.max():.4f}")
-            report_lines.append(f"  Phoneme - Worst class accuracy: {p_per_class.min():.4f}")
-            report_lines.append(f"  Phoneme - Best class accuracy: {p_per_class.max():.4f}")
+            report_lines.append(f"  Viseme - Worst class accuracy: {np.nanmin(v_per_class):.4f}")
+            report_lines.append(f"  Viseme - Best class accuracy: {np.nanmax(v_per_class):.4f}")
+            report_lines.append(f"  Phoneme - Worst class accuracy: {np.nanmin(p_per_class):.4f}")
+            report_lines.append(f"  Phoneme - Best class accuracy: {np.nanmax(p_per_class):.4f}")
             report_lines.append("")
 
         report_lines.append("=" * 80)
