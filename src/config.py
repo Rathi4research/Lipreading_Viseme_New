@@ -7,6 +7,7 @@ class Config:
     DATA_DIR = "data"
     VIDEO_DIR = os.path.join(DATA_DIR, "videos")
     ALIGNMENT_DIR = os.path.join(DATA_DIR, "alignments")
+    CHECKPOINT_DIR = "/content/drive/MyDrive/Lipreading_Checkpoints/
 
     # Model parameters
     VISUAL_FEATURE_DIM = 512
