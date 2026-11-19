@@ -93,15 +93,44 @@ class GRIDDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        video_path = sample.get('video_path', sample.get('video', ''))
+        align_path = sample.get('align_path', sample.get('align', ''))
 
-        # Load video frames (mouth cropped)
-        frames = self.load_video(sample['video_path'])
+        # Map original video path to the preprocessed .npy path
+        npy_path = video_path.replace('data/videos', 'data/preprocessed_lips').replace('.mpg', '.npy').replace('.mp4', '.npy')
 
-        # Load alignment (phoneme sequence with timestamps)
-        phonemes, words, visemes = self.load_alignment(sample['align_path'])
+        import numpy as np
+        import torch
+        import torch.nn.functional as F
+        from src.config import Config
+        from src.viseme_mapping import viseme_mapper
+
+        # Load the saved numpy array
+        frames = np.load(npy_path)
+
+        # Add the channel dimension so it becomes (T, 1, H, W)
+        video_tensor = torch.tensor(frames, dtype=torch.float32).unsqueeze(1)
+
+        # Pad or truncate sequence length to Config.SEQUENCE_LENGTH
+        seq_len = video_tensor.shape[0]
+        expected_seq_len = Config.SEQUENCE_LENGTH
+        if seq_len < expected_seq_len:
+            # Pad with zeros at the end
+            padding = torch.zeros((expected_seq_len - seq_len, 1, video_tensor.shape[2], video_tensor.shape[3]), dtype=torch.float32)
+            video_tensor = torch.cat((video_tensor, padding), dim=0)
+        elif seq_len > expected_seq_len:
+            # Truncate
+            video_tensor = video_tensor[:expected_seq_len]
+
+        # Force resize spatial dimensions to match the config
+        expected_h, expected_w = Config.FRAME_HEIGHT, Config.FRAME_WIDTH
+        if video_tensor.shape[-2:] != (expected_h, expected_w):
+            video_tensor = F.interpolate(video_tensor, size=(expected_h, expected_w), mode='bilinear', align_corners=False)
+
+        # Load alignment (phoneme sequence, words, visemes)
+        phonemes, words, visemes = self.load_alignment(align_path)
 
         # Convert to tensors
-        frames_tensor = torch.FloatTensor(frames)
         phonemes_tensor = torch.LongTensor(phonemes)
         visemes_tensor = torch.LongTensor(visemes)
 
@@ -109,14 +138,18 @@ class GRIDDataset(Dataset):
         ambiguity_scores = [viseme_mapper.get_ambiguity_score(v) for v in visemes]
         ambiguity_tensor = torch.FloatTensor(ambiguity_scores)
 
+        # Apply transforms if provided
+        if self.transform:
+            video_tensor = self.transform(video_tensor)
+
         return {
-            'frames': frames_tensor,
+            'frames': video_tensor,
             'phonemes': phonemes_tensor,
             'visemes': visemes_tensor,
             'ambiguity_scores': ambiguity_tensor,
             'words': words,
-            'subject': sample['subject'],
-            'utterance_id': sample['utterance_id']
+            'subject': sample.get('subject', ''),
+            'utterance_id': sample.get('utterance_id', '')
         }
 
     def load_video(self, video_path):
@@ -186,6 +219,8 @@ class GRIDDataset(Dataset):
                     if len(parts) >= 3:
                         label = parts[2]
                         if label != 'sp':  # skip pauses
+                            if len(parts) >= 2 and not (parts[0].isdigit() and parts[1].isdigit()):
+                                continue
                             start_frame = int(parts[0]) // 1000
                             end_frame = int(parts[1]) // 1000
                             intervals.append((start_frame, end_frame, label))
@@ -222,7 +257,23 @@ class GRIDDataset(Dataset):
 
 def collate_fn(batch):
     """Custom collate function for DataLoader"""
-    frames = torch.stack([item['frames'] for item in batch])
+    import torch
+    
+    # Ensure all frames have the same sequence length by padding to max_len in batch
+    max_len = max([item['frames'].shape[0] for item in batch])
+    
+    processed_frames = []
+    for item in batch:
+        f = item['frames']
+        if f.shape[0] < max_len:
+            # Pad along the temporal dimension (dim 0)
+            pad = torch.zeros((max_len - f.shape[0], f.shape[1], f.shape[2], f.shape[3]), dtype=f.dtype)
+            f = torch.cat([f, pad], dim=0)
+        elif f.shape[0] > max_len:
+            f = f[:max_len]
+        processed_frames.append(f)
+        
+    frames = torch.stack(processed_frames)
     phonemes = torch.stack([item['phonemes'] for item in batch])
     visemes = torch.stack([item['visemes'] for item in batch])
     ambiguity_scores = torch.stack([item['ambiguity_scores'] for item in batch])
@@ -246,10 +297,10 @@ def create_data_loaders(train_subjects=['s1'], val_subjects=['s2'], test_subject
     test_dataset = GRIDDataset(Config.DATA_DIR, subjects=test_subjects)
 
     train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE,
-                              shuffle=True, collate_fn=collate_fn, num_workers=4)
+                              shuffle=True, collate_fn=collate_fn, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE,
-                            shuffle=False, collate_fn=collate_fn, num_workers=4)
+                            shuffle=False, collate_fn=collate_fn, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE,
-                             shuffle=False, collate_fn=collate_fn, num_workers=4)
+                             shuffle=False, collate_fn=collate_fn, num_workers=0)
 
     return train_loader, val_loader, test_loader

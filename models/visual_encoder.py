@@ -60,7 +60,7 @@ class VisualEncoder(nn.Module):
             self.train(original_training)
 
     def forward(self, x):
-        batch_size, seq_len, height, width = x.shape
+        batch_size, seq_len, *spatial = x.shape
         x = x.unsqueeze(1)  # (B, 1, T, H, W)
 
         # Convolutions
@@ -106,8 +106,12 @@ class LipROI(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        batch_size, seq_len, height, width = x.shape
-        x_reshaped = x.view(batch_size * seq_len, 1, height, width)
+        if x.dim() == 5:
+            batch_size, seq_len, channels, height, width = x.shape
+            x_reshaped = x.view(batch_size * seq_len, channels, height, width)
+        else:
+            batch_size, seq_len, height, width = x.shape
+            x_reshaped = x.view(batch_size * seq_len, 1, height, width)
         attention = self.sigmoid(self.attention_conv(x_reshaped))
         x_attended = x_reshaped * attention
         x_attended = x_attended.view(batch_size, seq_len, height, width)

@@ -62,7 +62,7 @@ class VisemePhonemeAdaptiveModel(nn.Module):
     def forward(self, frames, phoneme_targets=None, word_targets=None,
                 speaker_ids=None, ambiguity_scores=None, model_type='full'):
 
-        batch_size, seq_len, height, width = frames.shape
+        batch_size, seq_len = frames.shape[:2]
 
         # 1. Visual feature extraction
         visual_features = self.visual_encoder(frames)
