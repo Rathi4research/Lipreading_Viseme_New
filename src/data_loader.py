@@ -51,6 +51,65 @@ GRID_WORD_TO_PHONEMES = {
 }
 
 
+def prepare_frames(frames, augment=False):
+    """Stored crops -> normalised model input (T, 1, FRAME_HEIGHT, FRAME_WIDTH) float tensor.
+
+    Shared by training, evaluation and test.py so every path sees identical preprocessing.
+      1. uint8 [0, 255] (or legacy float [0, 1]) -> float [0, 1]
+      2. spatial: crops larger than the model input are cropped to it — at a random position when
+         augmenting (training), centred otherwise; smaller/other sizes are resized
+      3. normalise: (x - Config.PIXEL_MEAN) / Config.PIXEL_STD
+      4. augment (training only, fresh per call): horizontal flip, time masking
+    """
+    x = torch.as_tensor(np.asarray(frames))
+    x = x.float() / 255.0 if x.dtype == torch.uint8 else x.float()
+    if x.dim() == 3:
+        x = x.unsqueeze(1)  # (T, 1, H, W)
+
+    th, tw = Config.FRAME_HEIGHT, Config.FRAME_WIDTH
+    h, w = x.shape[-2:]
+    if h >= th and w >= tw and (h, w) != (th, tw):
+        if augment:
+            top = int(torch.randint(0, h - th + 1, (1,)))
+            left = int(torch.randint(0, w - tw + 1, (1,)))
+        else:
+            top, left = (h - th) // 2, (w - tw) // 2
+        x = x[..., top:top + th, left:left + tw]
+    elif (h, w) != (th, tw):
+        x = F.interpolate(x, size=(th, tw), mode='bilinear', align_corners=False)
+
+    x = (x - Config.PIXEL_MEAN) / Config.PIXEL_STD
+
+    if augment:
+        if torch.rand(1).item() < Config.AUG_FLIP_PROB:
+            x = torch.flip(x, dims=[-1])
+        x = time_mask(x)
+    return x.contiguous()
+
+
+def time_mask(x):
+    """Replace a few random short spans of frames with the clip's mean frame.
+
+    Number of masks = AUG_TIME_MASKS_PER_SECOND x duration (TARGET_FPS frames per second), each up
+    to AUG_TIME_MASK_MAX_FRAMES long (the "adaptive time masking" of the standard VSR recipes).
+    Labels are left unchanged, so the model has to fill the gap from context.
+    """
+    num_frames = x.shape[0]
+    num_masks = int(round(Config.AUG_TIME_MASKS_PER_SECOND * num_frames / Config.TARGET_FPS))
+    max_len = min(Config.AUG_TIME_MASK_MAX_FRAMES, num_frames)
+    if num_masks <= 0 or max_len <= 0:
+        return x
+    x = x.clone()
+    mean_frame = x.mean(dim=0, keepdim=True)
+    for _ in range(num_masks):
+        length = int(torch.randint(0, max_len + 1, (1,)))
+        if length == 0:
+            continue
+        start = int(torch.randint(0, num_frames - length + 1, (1,)))
+        x[start:start + length] = mean_frame
+    return x
+
+
 class GRIDDataset(Dataset):
     """GRID utterances as (frames, per-frame phoneme/viseme labels).
 
@@ -61,10 +120,13 @@ class GRIDDataset(Dataset):
     the .align files — the raw videos are optional.
     """
 
-    def __init__(self, data_dir, subjects=['s1', 's2', 's3'], transform=None, max_samples_per_subject=None):
+    def __init__(self, data_dir, subjects=['s1', 's2', 's3'], transform=None, max_samples_per_subject=None,
+                 augment=False):
         self.data_dir = data_dir
         self.subjects = subjects
         self.transform = transform
+        # Training-time augmentation (random crop, flip, time masking); keep False for val/test
+        self.augment = augment
         self.samples = []
 
         # dlib is only needed for the on-the-fly fallback; initialised lazily.
@@ -114,7 +176,7 @@ class GRIDDataset(Dataset):
         return len(self.samples)
 
     def _load_frames(self, sample):
-        """Return frames as a float tensor of shape (T, 1, H, W)."""
+        """Return the stored crops as a numpy array (T, H, W): uint8, or float [0, 1] for legacy files."""
         if sample['npy_path'] is not None:
             frames = np.load(sample['npy_path'])
         elif sample['video_path'] is not None:
@@ -127,30 +189,22 @@ class GRIDDataset(Dataset):
         else:
             raise FileNotFoundError(f"No .npy or video found for {sample['subject']}/{sample['utterance_id']}")
 
-        return torch.tensor(frames, dtype=torch.float32).unsqueeze(1)
+        return frames
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
         align_path = sample['align_path']
 
-        video_tensor = self._load_frames(sample)
+        # Truncate to SEQUENCE_LENGTH, then crop/normalise/augment the real frames only
+        frames = self._load_frames(sample)[:Config.SEQUENCE_LENGTH]
+        num_valid_frames = len(frames)
+        video_tensor = prepare_frames(frames, augment=self.augment)
 
-        # Pad or truncate sequence length to Config.SEQUENCE_LENGTH
-        seq_len = video_tensor.shape[0]
-        expected_seq_len = Config.SEQUENCE_LENGTH
-        num_valid_frames = min(seq_len, expected_seq_len)
-        if seq_len < expected_seq_len:
-            # Pad with zeros at the end (these frames get label -1 below)
-            padding = torch.zeros((expected_seq_len - seq_len, 1, video_tensor.shape[2], video_tensor.shape[3]), dtype=torch.float32)
+        # Pad to SEQUENCE_LENGTH with zeros (= the mean pixel after normalisation); these frames
+        # get label -1 below and are ignored by the losses and metrics
+        if num_valid_frames < Config.SEQUENCE_LENGTH:
+            padding = torch.zeros((Config.SEQUENCE_LENGTH - num_valid_frames, *video_tensor.shape[1:]))
             video_tensor = torch.cat((video_tensor, padding), dim=0)
-        elif seq_len > expected_seq_len:
-            # Truncate
-            video_tensor = video_tensor[:expected_seq_len]
-
-        # Force resize spatial dimensions to match the config
-        expected_h, expected_w = Config.FRAME_HEIGHT, Config.FRAME_WIDTH
-        if video_tensor.shape[-2:] != (expected_h, expected_w):
-            video_tensor = F.interpolate(video_tensor, size=(expected_h, expected_w), mode='bilinear', align_corners=False)
 
         # Per-frame labels (phonemes, visemes, words); padding frames are -1
         phonemes, words, visemes, word_labels = self.load_alignment(align_path, num_valid_frames)
@@ -184,7 +238,7 @@ class GRIDDataset(Dataset):
 
         Uses the same cropping as scripts/preprocess.py so on-the-fly and preprocessed samples
         look alike. Needs dlib and shape_predictor_68_face_landmarks.dat; slow.
-        Returns float32 frames (T, H, W) in [0, 1].
+        Returns uint8 frames (T, PREPROCESS_SIZE, PREPROCESS_SIZE), like the stored .npy files.
         """
         from scripts import preprocess
 
@@ -195,11 +249,11 @@ class GRIDDataset(Dataset):
             preprocess._init_worker("shape_predictor_68_face_landmarks.dat")
             self._dlib_ready = True
 
-        frames = preprocess.extract_lip_sequence(video_path, size=Config.FRAME_HEIGHT,
+        frames = preprocess.extract_lip_sequence(video_path, size=Config.PREPROCESS_SIZE,
                                                  max_frames=Config.SEQUENCE_LENGTH)
         if not frames:
             raise RuntimeError(f"Could not read any frames from {video_path}")
-        return np.asarray(frames, dtype=np.float32) / 255.0
+        return np.asarray(frames, dtype=np.uint8)
 
     def load_alignment(self, align_path, num_valid_frames=None):
         """Build per-frame phoneme/viseme/word label sequences aligned to the video's frame grid.
@@ -310,14 +364,15 @@ def create_data_loaders(train_subjects=['s1'], val_subjects=['s2'], test_subject
     max_samples_per_subject caps utterances per speaker (e.g. for a quick local run).
     """
 
-    def make(subjects, shuffle):
+    def make(subjects, shuffle, augment):
         dataset = GRIDDataset(Config.DATA_DIR, subjects=subjects,
-                              max_samples_per_subject=max_samples_per_subject)
+                              max_samples_per_subject=max_samples_per_subject, augment=augment)
         return DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=shuffle,
                           collate_fn=collate_fn, num_workers=Config.NUM_WORKERS)
 
-    train_loader = make(train_subjects, shuffle=True)
-    val_loader = make(val_subjects, shuffle=False)
-    test_loader = make(test_subjects, shuffle=False)
+    # Augmentation only ever applies to the training split (Config.AUGMENT, main.py --no-augment)
+    train_loader = make(train_subjects, shuffle=True, augment=Config.AUGMENT)
+    val_loader = make(val_subjects, shuffle=False, augment=False)
+    test_loader = make(test_subjects, shuffle=False, augment=False)
 
     return train_loader, val_loader, test_loader

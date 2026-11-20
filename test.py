@@ -15,9 +15,9 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from src.config import Config, detect_device
+from src.data_loader import prepare_frames
 from models.fusion_network import ModelFactory
 
 
@@ -37,7 +37,11 @@ def load_model(model_path):
 
 
 def load_input(path, landmarks='shape_predictor_68_face_landmarks.dat'):
-    """Return lip-crop frames as a (1, T, 1, H, W) tensor padded/truncated to SEQUENCE_LENGTH"""
+    """Return model-ready frames (1, T, 1, H, W), padded to SEQUENCE_LENGTH, plus the real length.
+
+    Uses the data loader's prepare_frames (centre crop + normalisation, no augmentation), so the
+    input matches what the model saw during evaluation.
+    """
     if not os.path.exists(path):
         print(f"Input not found: {path}")
         return None, 0
@@ -50,19 +54,15 @@ def load_input(path, landmarks='shape_predictor_68_face_landmarks.dat'):
             print("dlib is required to crop raw video; use a preprocessed .npy instead")
             return None, 0
         preprocess._init_worker(landmarks)
-        frames = preprocess.extract_lip_sequence(path, size=Config.FRAME_HEIGHT,
-                                                 max_frames=Config.SEQUENCE_LENGTH)
-        frames = np.asarray(frames, dtype=np.float32) / 255.0
+        frames = np.asarray(preprocess.extract_lip_sequence(path, size=Config.PREPROCESS_SIZE,
+                                                            max_frames=Config.SEQUENCE_LENGTH), dtype=np.uint8)
 
-    video = torch.tensor(frames, dtype=torch.float32).unsqueeze(1)  # (T, 1, H, W)
-    num_valid = min(video.shape[0], Config.SEQUENCE_LENGTH)
-    video = video[:Config.SEQUENCE_LENGTH]
-    if video.shape[0] < Config.SEQUENCE_LENGTH:
-        pad = torch.zeros(Config.SEQUENCE_LENGTH - video.shape[0], *video.shape[1:])
+    frames = frames[:Config.SEQUENCE_LENGTH]
+    num_valid = len(frames)
+    video = prepare_frames(frames, augment=False)  # (T, 1, H, W)
+    if num_valid < Config.SEQUENCE_LENGTH:
+        pad = torch.zeros(Config.SEQUENCE_LENGTH - num_valid, *video.shape[1:])
         video = torch.cat([video, pad], dim=0)
-    if video.shape[-2:] != (Config.FRAME_HEIGHT, Config.FRAME_WIDTH):
-        video = F.interpolate(video, size=(Config.FRAME_HEIGHT, Config.FRAME_WIDTH),
-                              mode='bilinear', align_corners=False)
     return video.unsqueeze(0), num_valid
 
 

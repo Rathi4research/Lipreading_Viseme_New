@@ -19,14 +19,15 @@ There is no packaging, linting, or automated test setup. Everything is run direc
 pip install -r requirements.txt
 # dlib is only needed for scripts/preprocess.py (and the slow on-the-fly fallback in the data loader)
 
-# Pre-extract lip crops once (parallel dlib) -> data/preprocessed_lips/<speaker>/<utt>.npy
-python scripts/preprocess.py --speakers s1 s2 s3 --size 80 [--crop-mode square|tight] [--backup-dir <drive folder>]
+# Pre-extract mouth crops once (parallel dlib) -> data/preprocessed_lips/<speaker>/<utt>.npy (+ .meta.npz)
+# Default: face-aligned 96x96 uint8 crops; --crop-mode square|tight for the older crops (ablations)
+python scripts/preprocess.py --speakers s1 s2 s3 [--backup-dir <drive folder>]
 
 # Train (mode is positional; subjects/model-type/etc. are flags)
-python main.py train --model-type full --frame-size 80 --train-subjects s1 --val-subjects s2 --test-subjects s3
+python main.py train --model-type full --train-subjects s1 --val-subjects s2 --test-subjects s3
 
 # Quick local run (e.g. Apple Silicon/MPS): checkpoints to ./checkpoints, few utterances per speaker
-python main.py train --local-checkpoints --frame-size 80 --max-samples-per-subject 50 --num-epochs 2
+python main.py train --local-checkpoints --max-samples-per-subject 50 --num-epochs 2
 
 # Resume an interrupted run (last_model.pth is written every epoch)
 python main.py train ... --resume-from <checkpoint-dir>/last_model.pth
@@ -51,8 +52,8 @@ python test.py <checkpoint.pth> <file.npy|video> [speaker]
 `main()` for a minimal training run; `main.py train` is the primary entry point and supersedes it.
 
 Runtime flags on `main.py` (all modes): `--device auto|cuda|mps|cpu` (auto = cuda > mps > cpu),
-`--data-dir`, `--frame-size`, `--num-workers`, `--max-samples-per-subject`, `--batch-size`,
-`--learning-rate`. Checkpoint location for `train`: `Config.CHECKPOINT_DIR` (Google Drive on Colab) by
+`--data-dir`, `--frame-size` (model input, default 88), `--no-augment`, `--num-workers`,
+`--max-samples-per-subject`, `--batch-size`, `--learning-rate`. Checkpoint location for `train`: `Config.CHECKPOINT_DIR` (Google Drive on Colab) by
 default, `--local-checkpoints` for `./checkpoints`, or `--checkpoint-dir PATH`. The trainer writes
 `best_model.pth`, `last_model.pth` (every epoch), `checkpoint_epoch_N.pth` (every 5),
 `training_metrics.csv` (one row per epoch) and `test_results.json` into that directory.
@@ -67,12 +68,22 @@ The `GRIDDataset` (`src/data_loader.py`) expects, per subject (e.g. `s1`, `s2`, 
 
 ```
 data/alignments/<subject>/<utterance_id>.align        # "start end word" lines, GRID forced alignments
-data/preprocessed_lips/<subject>/<utterance_id>.npy   # (T, H, W) float32 lip crops from scripts/preprocess.py
+data/preprocessed_lips/<subject>/<utterance_id>.npy   # (T, 96, 96) uint8 mouth crops from scripts/preprocess.py
+data/preprocessed_lips/<subject>/<utterance_id>.meta.npz  # landmarks, detection mask, crop transforms (not yet used)
 data/videos/<subject>/<utterance_id>.mpg|.mp4         # optional: only used if the .npy is missing
 ```
 
-Samples are discovered from the `.npy` files and/or videos (an `.align` file is required). Frames are
-padded/truncated to `Config.SEQUENCE_LENGTH` and resized to `Config.FRAME_HEIGHT x FRAME_WIDTH`. If an
+Samples are discovered from the `.npy` files and/or videos (an `.align` file is required).
+`src/data_loader.py:prepare_frames` (shared by training, evaluation and `test.py`) turns stored crops
+into model input: uint8 -> [0,1], crop to `Config.FRAME_HEIGHT x FRAME_WIDTH` (random position when
+training, centre otherwise; smaller inputs such as old 80x80 float files are resized), normalise with
+`Config.PIXEL_MEAN/PIXEL_STD`, and — training split only, fresh per sample — horizontal flip and time
+masking (`Config.AUG_*`). Clips are then padded/truncated to `Config.SEQUENCE_LENGTH`.
+
+Preprocessing (`scripts/preprocess.py`, default `--crop-mode aligned`): dlib 68 landmarks per frame,
+missed frames linearly interpolated, landmarks smoothed over 12 frames (crop placement only), then a
+per-frame similarity transform that levels the eye line, scales the crop to 1.4x the eye-centre
+distance (face-sized, so mouth opening/rounding does not change the zoom) and centres the mouth corners. If an
 utterance has no `.npy`, the raw video is cropped on the fly with dlib (slow; needs
 `shape_predictor_68_face_landmarks.dat` at the repo root). None of this data is checked into the repo.
 

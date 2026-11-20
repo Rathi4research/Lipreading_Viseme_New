@@ -335,7 +335,8 @@ def create_sample_data(num_utterances=6, subjects=('s1', 's2', 's3')):
                 f.write('\n'.join(lines) + '\n')
 
             num_frames = Config.SEQUENCE_LENGTH - (n % 2) * 3  # some clips slightly short
-            frames = rng.random((num_frames, Config.FRAME_HEIGHT, Config.FRAME_WIDTH), dtype=np.float32)
+            size = Config.PREPROCESS_SIZE
+            frames = rng.integers(0, 256, (num_frames, size, size), dtype=np.uint8)
             np.save(os.path.join(npy_dir, utterance_id + '.npy'), frames)
 
     logger.info(f"Synthetic data created for {list(subjects)} ({num_utterances} utterances each).")
@@ -387,8 +388,11 @@ def main():
     parser.add_argument('--data-dir', type=str, default=Config.DATA_DIR,
                         help='Root holding videos/, alignments/ and preprocessed_lips/')
     parser.add_argument('--frame-size', type=int,
-                        help='Square frame size fed to the model (e.g. 80 to match the '
-                             'preprocessed .npy crops); default from src/config.py')
+                        help=f'Square model input size (default {Config.FRAME_HEIGHT}). Stored crops '
+                             f'larger than this are random-cropped (train) / centre-cropped (eval); '
+                             f'smaller ones are resized (e.g. pass 72 or 80 for older 80x80 .npy files)')
+    parser.add_argument('--no-augment', action='store_true',
+                        help='Disable training-time augmentation (random crop, flip, time masking)')
     parser.add_argument('--max-samples-per-subject', type=int,
                         help='Use at most N utterances per speaker (quick/local runs)')
 
@@ -419,11 +423,14 @@ def main():
     Config.set_data_dir(args.data_dir)
     if args.frame_size:
         Config.FRAME_WIDTH = Config.FRAME_HEIGHT = args.frame_size
+    if args.no_augment:
+        Config.AUGMENT = False
 
     logger.info(f"Using device: {Config.DEVICE}")
     logger.info(f"Mode: {args.mode}")
     logger.info(f"Model type: {args.model_type or ('full' if args.mode == 'train' else 'from checkpoint')}")
-    logger.info(f"Data dir: {Config.DATA_DIR} | Frame size: {Config.FRAME_HEIGHT}x{Config.FRAME_WIDTH}")
+    logger.info(f"Data dir: {Config.DATA_DIR} | Model input: {Config.FRAME_HEIGHT}x{Config.FRAME_WIDTH} | "
+                f"Train augmentation: {'on' if Config.AUGMENT else 'off'}")
 
     # Execute based on mode
     try:

@@ -289,6 +289,10 @@ class ModelFactory:
             print(f"[load_pretrained_model] Using the checkpoint's frame size {saved_size[0]}x{saved_size[1]} "
                   f"(was {Config.FRAME_HEIGHT}x{Config.FRAME_WIDTH})")
             Config.FRAME_HEIGHT, Config.FRAME_WIDTH = saved_size
+        # Same input normalisation as in training
+        for key in ('PIXEL_MEAN', 'PIXEL_STD'):
+            if key in saved_config:
+                setattr(Config, key, saved_config[key])
 
         saved_type = checkpoint.get('model_type')
         if saved_type and model_type and model_type != saved_type:

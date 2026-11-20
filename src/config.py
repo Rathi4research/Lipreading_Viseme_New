@@ -41,9 +41,23 @@ class Config:
 
     # Video processing
     TARGET_FPS = 25
-    FRAME_WIDTH = 96
-    FRAME_HEIGHT = 96
+    # Model input size. Crops are stored larger (PREPROCESS_SIZE, by scripts/preprocess.py) and the
+    # data loader random-crops (training) or centre-crops (eval) this size out of them.
+    FRAME_WIDTH = 88
+    FRAME_HEIGHT = 88
+    PREPROCESS_SIZE = 96
     SEQUENCE_LENGTH = 75  # Max sequence length
+
+    # Pixel normalisation applied by the data loader after scaling to [0, 1]
+    # (grayscale mouth-crop statistics used by the standard LRW/LRS3 recipes)
+    PIXEL_MEAN = 0.421
+    PIXEL_STD = 0.165
+
+    # Training-time augmentation, drawn fresh for every sample, training split only
+    AUGMENT = True
+    AUG_FLIP_PROB = 0.5             # horizontal flip
+    AUG_TIME_MASK_MAX_FRAMES = 10   # max length of each time mask
+    AUG_TIME_MASKS_PER_SECOND = 1.0 # number of masks = this x clip duration (25 frames = 1 s)
 
     # Training parameters
     BATCH_SIZE = 16
