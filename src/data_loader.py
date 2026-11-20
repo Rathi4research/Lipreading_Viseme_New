@@ -67,9 +67,8 @@ class GRIDDataset(Dataset):
         self.transform = transform
         self.samples = []
 
-        # dlib detector/predictor are only needed for the on-the-fly fallback; created lazily.
-        self._detector = None
-        self._predictor = None
+        # dlib is only needed for the on-the-fly fallback; initialised lazily.
+        self._dlib_ready = False
         self._warned_fallback = False
 
         for subject in subjects:
@@ -139,8 +138,9 @@ class GRIDDataset(Dataset):
         # Pad or truncate sequence length to Config.SEQUENCE_LENGTH
         seq_len = video_tensor.shape[0]
         expected_seq_len = Config.SEQUENCE_LENGTH
+        num_valid_frames = min(seq_len, expected_seq_len)
         if seq_len < expected_seq_len:
-            # Pad with zeros at the end
+            # Pad with zeros at the end (these frames get label -1 below)
             padding = torch.zeros((expected_seq_len - seq_len, 1, video_tensor.shape[2], video_tensor.shape[3]), dtype=torch.float32)
             video_tensor = torch.cat((video_tensor, padding), dim=0)
         elif seq_len > expected_seq_len:
@@ -152,14 +152,15 @@ class GRIDDataset(Dataset):
         if video_tensor.shape[-2:] != (expected_h, expected_w):
             video_tensor = F.interpolate(video_tensor, size=(expected_h, expected_w), mode='bilinear', align_corners=False)
 
-        # Load alignment (phoneme sequence, words, visemes)
-        phonemes, words, visemes = self.load_alignment(align_path)
+        # Per-frame labels (phonemes, visemes, words); padding frames are -1
+        phonemes, words, visemes, word_labels = self.load_alignment(align_path, num_valid_frames)
 
         # Convert to tensors
         phonemes_tensor = torch.LongTensor(phonemes)
         visemes_tensor = torch.LongTensor(visemes)
+        word_labels_tensor = torch.LongTensor(word_labels)
 
-        # Calculate ambiguity scores
+        # Ground-truth ambiguity scores — for analysis/metrics only, never a model input
         ambiguity_scores = [viseme_mapper.get_ambiguity_score(v) for v in visemes]
         ambiguity_tensor = torch.FloatTensor(ambiguity_scores)
 
@@ -171,6 +172,7 @@ class GRIDDataset(Dataset):
             'frames': video_tensor,
             'phonemes': phonemes_tensor,
             'visemes': visemes_tensor,
+            'word_labels': word_labels_tensor,
             'ambiguity_scores': ambiguity_tensor,
             'words': words,
             'subject': sample['subject'],
@@ -178,60 +180,32 @@ class GRIDDataset(Dataset):
         }
 
     def load_video(self, video_path):
-        """Load video frames and crop mouth region (on-the-fly fallback; needs dlib + cv2)"""
-        import cv2
-        import dlib
+        """Crop the lip region from a raw video on the fly (fallback when no .npy exists).
 
-        if self._detector is None:
-            self._detector = dlib.get_frontal_face_detector()
-            self._predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+        Uses the same cropping as scripts/preprocess.py so on-the-fly and preprocessed samples
+        look alike. Needs dlib and shape_predictor_68_face_landmarks.dat; slow.
+        Returns float32 frames (T, H, W) in [0, 1].
+        """
+        from scripts import preprocess
 
-        cap = cv2.VideoCapture(video_path)
-        frames = []
+        if not self._dlib_ready:
+            if preprocess.dlib is None:
+                raise RuntimeError("dlib is required to crop raw videos; run scripts/preprocess.py "
+                                   "(e.g. on Colab) to create .npy files instead")
+            preprocess._init_worker("shape_predictor_68_face_landmarks.dat")
+            self._dlib_ready = True
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        frames = preprocess.extract_lip_sequence(video_path, size=Config.FRAME_HEIGHT,
+                                                 max_frames=Config.SEQUENCE_LENGTH)
+        if not frames:
+            raise RuntimeError(f"Could not read any frames from {video_path}")
+        return np.asarray(frames, dtype=np.float32) / 255.0
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            dets = self._detector(gray, 1)
+    def load_alignment(self, align_path, num_valid_frames=None):
+        """Build per-frame phoneme/viseme/word label sequences aligned to the video's frame grid.
 
-            if len(dets) > 0:
-                shape = self._predictor(gray, dets[0])
-                mouth_points = shape.parts()[48:68]  # landmarks 48–67 are mouth
-                x_min = min([p.x for p in mouth_points])
-                y_min = min([p.y for p in mouth_points])
-                x_max = max([p.x for p in mouth_points])
-                y_max = max([p.y for p in mouth_points])
-
-                # crop mouth ROI
-                mouth_roi = gray[y_min:y_max, x_min:x_max]
-                mouth_roi = cv2.resize(mouth_roi, (Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
-                mouth_roi = mouth_roi.astype(np.float32) / 255.0
-                frames.append(mouth_roi)
-            else:
-                # fallback: use whole resized frame
-                frame = cv2.resize(gray, (Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
-                frame = frame.astype(np.float32) / 255.0
-                frames.append(frame)
-
-        cap.release()
-
-        # Pad or truncate to fixed length
-        frames = np.array(frames)
-
-        if len(frames) > Config.SEQUENCE_LENGTH:
-            frames = frames[:Config.SEQUENCE_LENGTH]
-        elif len(frames) < Config.SEQUENCE_LENGTH:
-            padding = np.zeros((Config.SEQUENCE_LENGTH - len(frames),
-                                Config.FRAME_HEIGHT, Config.FRAME_WIDTH))
-            frames = np.concatenate([frames, padding], axis=0)
-
-        return frames
-
-    def load_alignment(self, align_path):
-        """Build a per-frame phoneme/viseme sequence aligned to the video's frame grid.
+        Returns (phoneme_indices, words, viseme_indices, word_indices), the index lists being
+        Config.SEQUENCE_LENGTH long; frames >= num_valid_frames (padding) are labelled -1.
 
         GRID .align timestamps are given in units of 1/25000 sec; dividing by 1000
         converts them to a frame index at the corpus's native 25 fps (Config.TARGET_FPS,
@@ -261,6 +235,7 @@ class GRIDDataset(Dataset):
 
         num_frames = Config.SEQUENCE_LENGTH
         frame_phonemes = ['sil'] * num_frames
+        frame_words = ['sil'] * num_frames
 
         for start_frame, end_frame, label in intervals:
             word_phones = GRID_WORD_TO_PHONEMES.get(label)
@@ -276,15 +251,22 @@ class GRIDDataset(Dataset):
                 phone_idx = min(int((t - start_frame) / span * len(word_phones)),
                                  len(word_phones) - 1)
                 frame_phonemes[t] = word_phones[phone_idx]
+                frame_words[t] = label if label in Config.VOCABULARY else 'sil'
 
-        # Convert per-frame phonemes to indices
+        # Convert per-frame labels to indices
         phoneme_to_idx = {p: i for i, p in enumerate(Config.PHONEMES)}
         phoneme_indices = [phoneme_to_idx.get(p, 0) for p in frame_phonemes]
-
-        # Convert to visemes
         viseme_indices = viseme_mapper.phoneme_to_viseme_sequence(frame_phonemes)
+        word_to_idx = {w: i for i, w in enumerate(Config.VOCABULARY)}
+        word_indices = [word_to_idx[w] for w in frame_words]
 
-        return phoneme_indices, words, viseme_indices
+        # Frames past the end of the actual video are zero padding, not silence: label them -1
+        # so they are ignored by the losses and accuracy metrics.
+        if num_valid_frames is not None and num_valid_frames < num_frames:
+            for t in range(num_valid_frames, num_frames):
+                phoneme_indices[t] = viseme_indices[t] = word_indices[t] = -1
+
+        return phoneme_indices, words, viseme_indices, word_indices
 
 
 def collate_fn(batch):
@@ -306,12 +288,14 @@ def collate_fn(batch):
     frames = torch.stack(processed_frames)
     phonemes = torch.stack([item['phonemes'] for item in batch])
     visemes = torch.stack([item['visemes'] for item in batch])
+    word_labels = torch.stack([item['word_labels'] for item in batch])
     ambiguity_scores = torch.stack([item['ambiguity_scores'] for item in batch])
 
     return {
         'frames': frames,
         'phonemes': phonemes,
         'visemes': visemes,
+        'word_labels': word_labels,
         'ambiguity_scores': ambiguity_scores,
         'words': [item['words'] for item in batch],
         'subjects': [item['subject'] for item in batch],

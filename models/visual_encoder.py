@@ -5,10 +5,17 @@ from src.config import Config
 
 
 class VisualEncoder(nn.Module):
+    """3D-CNN over the lip-crop sequence -> one feature vector per input frame.
+
+    Pooling is spatial only (kernel (1, 2, 2)), so the temporal resolution of the input is kept
+    end to end: every one of the SEQUENCE_LENGTH frames gets its own feature vector (and its own
+    per-frame viseme/phoneme prediction). The earlier design pooled time 75 -> 9 and linearly
+    interpolated back, i.e. ~330 ms per step, coarser than most phonemes.
+    """
+
     def __init__(self, input_dim=None,
                  output_dim=None,
-                 input_channels=1,
-                 dummy_seq_len=None):
+                 input_channels=1):
         super(VisualEncoder, self).__init__()
 
         # Read Config at construction time (not import time) so runtime overrides such as
@@ -18,20 +25,19 @@ class VisualEncoder(nn.Module):
 
         self.input_channels = input_channels
         self.input_dim = input_dim
-        self.dummy_seq_len = dummy_seq_len or Config.SEQUENCE_LENGTH
 
-        # 3D CNN for spatio-temporal feature extraction
+        # 3D CNN for spatio-temporal feature extraction (temporal kernel 3, temporal stride 1)
         self.conv3d_1 = nn.Conv3d(input_channels, 64, kernel_size=(3, 3, 3), padding=(1, 1, 1))
         self.pool3d_1 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
         self.conv3d_2 = nn.Conv3d(64, 128, kernel_size=(3, 3, 3), padding=(1, 1, 1))
-        self.pool3d_2 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+        self.pool3d_2 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
         self.conv3d_3 = nn.Conv3d(128, 256, kernel_size=(3, 3, 3), padding=(1, 1, 1))
-        self.pool3d_3 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+        self.pool3d_3 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
         self.conv3d_4 = nn.Conv3d(256, 512, kernel_size=(3, 3, 3), padding=(1, 1, 1))
-        self.pool3d_4 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+        self.pool3d_4 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
         # Batch normalization layers
         self.bn1 = nn.BatchNorm3d(64)
@@ -41,91 +47,82 @@ class VisualEncoder(nn.Module):
 
         self.dropout = nn.Dropout(Config.DROPOUT_RATE)
 
-        # Calculate flattened dimension after conv layers
-        self.conv_output_size = self._calculate_conv_output_size(self.input_dim, self.dummy_seq_len)
-        print(f"[VisualEncoder] Calculated conv output size: {self.conv_output_size}")
+        # Per-frame feature size after the conv stack (channels * H' * W'). Built here, in
+        # __init__, so the projection is registered before the optimizer is created and is
+        # therefore actually trained (previously it was created lazily on the first forward
+        # pass and never reached the optimizer).
+        self.frame_feature_size = self._calculate_frame_feature_size(self.input_dim)
+        print(f"[VisualEncoder] Per-frame conv feature size: {self.frame_feature_size}")
 
-        # Fully connected layers
-        self.fc1 = nn.Linear(self.conv_output_size, 1024)
+        # Per-frame projection
+        self.fc1 = nn.Linear(self.frame_feature_size, 1024)
         self.fc2 = nn.Linear(1024, output_dim)
 
-    def _calculate_conv_output_size(self, input_dim, seq_len):
-        """Calculate output size by doing a forward pass with the conv layers."""
+    def _conv_stack(self, x):
+        x = self.dropout(self.pool3d_1(F.relu(self.bn1(self.conv3d_1(x)))))
+        x = self.dropout(self.pool3d_2(F.relu(self.bn2(self.conv3d_2(x)))))
+        x = self.dropout(self.pool3d_3(F.relu(self.bn3(self.conv3d_3(x)))))
+        x = self.dropout(self.pool3d_4(F.relu(self.bn4(self.conv3d_4(x)))))
+        return x
+
+    def _calculate_frame_feature_size(self, input_dim):
+        """Channels * H' * W' of the conv output for a single frame position."""
         original_training = self.training
         try:
             self.eval()
             with torch.no_grad():
-                dummy_input = torch.zeros(1, self.input_channels, seq_len, input_dim[0], input_dim[1])
-                x = self.pool3d_1(F.relu(self.bn1(self.conv3d_1(dummy_input))))
-                x = self.pool3d_2(F.relu(self.bn2(self.conv3d_2(x))))
-                x = self.pool3d_3(F.relu(self.bn3(self.conv3d_3(x))))
-                x = self.pool3d_4(F.relu(self.bn4(self.conv3d_4(x))))
-                return x.view(1, -1).size(1)
+                # 3 frames is enough: time is never pooled, so only H/W matter
+                dummy_input = torch.zeros(1, self.input_channels, 3, input_dim[0], input_dim[1])
+                _, c, _, h, w = self._conv_stack(dummy_input).shape
+                return c * h * w
         finally:
             self.train(original_training)
 
     def forward(self, x):
-        batch_size, seq_len, *spatial = x.shape
+        """
+        Args:
+            x: frames (B, T, H, W) or (B, T, 1, H, W)
+        Returns:
+            features: (B, T, output_dim)
+        """
+        if x.dim() == 5:
+            x = x.squeeze(2)
+        batch_size, seq_len = x.shape[:2]
         x = x.unsqueeze(1)  # (B, 1, T, H, W)
 
-        # Convolutions
-        x = self.pool3d_1(F.relu(self.bn1(self.conv3d_1(x))))
-        x = self.dropout(x)
-        x = self.pool3d_2(F.relu(self.bn2(self.conv3d_2(x))))
-        x = self.dropout(x)
-        x = self.pool3d_3(F.relu(self.bn3(self.conv3d_3(x))))
-        x = self.dropout(x)
-        x = self.pool3d_4(F.relu(self.bn4(self.conv3d_4(x))))
-        x = self.dropout(x)
+        x = self._conv_stack(x)
 
         b, c, t, h, w = x.shape
-        x = x.permute(0, 2, 1, 3, 4).contiguous()
-        x = x.view(b * t, -1)
+        x = x.permute(0, 2, 1, 3, 4).contiguous().view(b * t, c * h * w)
 
-        # Dynamically create fc1 if not exist
-        self.ensure_dynamic_layers(x.size(1), x.device)
-
-        x = F.relu(self.fc1_dynamic(x))
-        x = self.dropout(x)
-        features = self.fc2_dynamic(x)
-
-        features = features.view(b, t, -1)
-        if t != seq_len:
-            features = F.interpolate(features.permute(0, 2, 1),
-                                     size=seq_len,
-                                     mode='linear',
-                                     align_corners=False)
-            features = features.permute(0, 2, 1)
-
+        x = self.dropout(F.relu(self.fc1(x)))
+        features = self.fc2(x).view(b, t, -1)
         return features
 
-    def ensure_dynamic_layers(self, in_features, device=None):
-        """Create fc1_dynamic/fc2_dynamic (per-timestep projection) if they don't exist yet."""
-        if not hasattr(self, 'fc1_dynamic'):
-            self.fc1_dynamic = nn.Linear(in_features, 1024)
-            self.fc2_dynamic = nn.Linear(1024, Config.VISUAL_FEATURE_DIM)
-            if device is not None:
-                self.fc1_dynamic.to(device)
-                self.fc2_dynamic.to(device)
 
+def upgrade_legacy_state_dict(state_dict):
+    """Map checkpoints from the old VisualEncoder layout onto the current one.
 
-def materialize_lazy_layers(model, state_dict):
-    """Create any lazily-built VisualEncoder layers present in state_dict before loading it.
-
-    VisualEncoder builds fc1_dynamic/fc2_dynamic on its first forward pass, so a freshly
-    constructed model has no such parameters and load_state_dict would reject (strict) or
-    silently drop (strict=False / key filtering) the trained weights.
+    Old layout: an unused static fc1/fc2 sized for the whole (temporally pooled) clip, plus the
+    per-frame projection created lazily as fc1_dynamic/fc2_dynamic. Current layout: the per-frame
+    projection is fc1/fc2. Old weights are only shape-compatible if the old model used the same
+    frame size; load_pretrained_model() drops anything that still doesn't fit.
     """
-    suffix = '.fc1_dynamic.weight'
-    for key, tensor in state_dict.items():
-        if key.endswith(suffix):
-            encoder = model.get_submodule(key[:-len(suffix)])
-            device = next(encoder.parameters()).device
-            encoder.ensure_dynamic_layers(tensor.shape[1], device)
+    if not any('.fc1_dynamic.' in k for k in state_dict):
+        return state_dict
+    upgraded = {}
+    for key, value in state_dict.items():
+        if '.fc1_dynamic.' in key or '.fc2_dynamic.' in key:
+            upgraded[key.replace('_dynamic.', '.')] = value
+        elif '.visual_encoder.fc1.' in key or '.visual_encoder.fc2.' in key:
+            continue  # old static (never-used) layers
+        else:
+            upgraded[key] = value
+    return upgraded
 
 
 class LipROI(nn.Module):
-    """Lip Region of Interest extraction module"""
+    """Lip Region of Interest extraction module (per-frame spatial attention gate)"""
 
     def __init__(self):
         super(LipROI, self).__init__()
@@ -133,16 +130,14 @@ class LipROI(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
+        """x: (B, T, H, W) or (B, T, 1, H, W) -> (B, T, H, W)"""
         if x.dim() == 5:
-            batch_size, seq_len, channels, height, width = x.shape
-            x_reshaped = x.view(batch_size * seq_len, channels, height, width)
-        else:
-            batch_size, seq_len, height, width = x.shape
-            x_reshaped = x.view(batch_size * seq_len, 1, height, width)
+            x = x.squeeze(2)
+        batch_size, seq_len, height, width = x.shape
+        x_reshaped = x.reshape(batch_size * seq_len, 1, height, width)
         attention = self.sigmoid(self.attention_conv(x_reshaped))
         x_attended = x_reshaped * attention
-        x_attended = x_attended.view(batch_size, seq_len, height, width)
-        return x_attended
+        return x_attended.view(batch_size, seq_len, height, width)
 
 
 class EnhancedVisualEncoder(nn.Module):

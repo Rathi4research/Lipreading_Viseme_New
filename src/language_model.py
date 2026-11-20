@@ -1,12 +1,11 @@
-import torch
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from src.config import Config
+from models.sequence_model import PositionalEncoding
 
-# ✅ put here
+
 def time_match(x, target_len: int):
     """
     Align sequence length S -> target_len.
@@ -24,24 +23,33 @@ def time_match(x, target_len: int):
 
 
 class GRIDLanguageModel(nn.Module):
-    """Language model specifically designed for GRID corpus structure"""
+    """Word-level context model over the frame sequence.
+
+    Input is a per-frame feature sequence (in the full model: the phoneme-LM features, so this
+    is the "word" level of a bottom-up hierarchy). Word indices can still be given directly for
+    stand-alone use. A learned absolute frame-position embedding lets it pick up GRID's fixed
+    sentence layout ([command][color][preposition][letter][digit][adverb] occur at roughly
+    stable times within the 3 s clip). (Previously the input was always all-zero tokens and the
+    position was frame_index % 6, which treated individual frames as GRID word slots.)
+    """
 
     def __init__(self, vocab_size=len(Config.VOCABULARY),
                  embed_dim=Config.HIDDEN_DIM,
                  hidden_dim=Config.HIDDEN_DIM,
-                 num_layers=2):
+                 num_layers=2,
+                 max_len=None):
         super(GRIDLanguageModel, self).__init__()
 
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
+        self.max_len = max_len or Config.SEQUENCE_LENGTH
 
-        # Word embeddings
+        # Word embeddings (used only when word indices are passed in)
         self.word_embedding = nn.Embedding(vocab_size, embed_dim)
 
-        # Position embeddings for GRID sentence structure
-        # GRID: [command] [color] [preposition] [letter] [digit] [adverb]
-        self.position_embedding = nn.Embedding(6, embed_dim)
+        # Absolute frame-position embeddings
+        self.position_embedding = nn.Embedding(self.max_len, embed_dim)
 
         # LSTM language model
         self.lstm = nn.LSTM(
@@ -56,7 +64,7 @@ class GRIDLanguageModel(nn.Module):
         # Output projection
         self.output_projection = nn.Linear(hidden_dim * 2, vocab_size)
 
-        # Grammar-aware attention
+        # Self-attention over the sequence
         self.grammar_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim * 2,
             num_heads=Config.NUM_HEADS,
@@ -64,10 +72,8 @@ class GRIDLanguageModel(nn.Module):
             batch_first=True
         )
 
-        # Dropout
         self.dropout = nn.Dropout(Config.DROPOUT_RATE)
 
-        # Initialize word type embeddings for GRID structure
         self._init_word_type_mappings()
 
     def _init_word_type_mappings(self):
@@ -82,77 +88,52 @@ class GRIDLanguageModel(nn.Module):
             5: Config.ADVERBS  # adverb
         }
 
-        # Create reverse mapping
         for type_id, words in self.type_to_words.items():
             for word in words:
                 if word in Config.VOCABULARY:
-                    word_idx = Config.VOCABULARY.index(word)
-                    self.word_to_type[word_idx] = type_id
+                    self.word_to_type[Config.VOCABULARY.index(word)] = type_id
 
-    def forward(self, word_indices=None, sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
+    def forward(self, input_features=None, word_indices=None,
+                sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
         """
         Args:
-            word_indices: Word indices (batch_size, seq_len) - optional for unconditional generation
-            sequence_length: Length of sequence to generate features for
-            batch_size: Batch size to use when word_indices is None (must match the caller's real
-                batch size so downstream concatenation with per-sample features doesn't break)
+            input_features: per-frame input features (B, T, embed_dim), or
+            word_indices: word indices (B, T); if neither is given an all-zero input is used
         Returns:
-            language_features: Language model features (batch_size, seq_len, hidden_dim * 2)
-            word_probs: Word probabilities (batch_size, seq_len, vocab_size)
+            language_features: (B, T, hidden_dim * 2)
+            word_logits: (B, T, vocab_size)
         """
-        if word_indices is not None:
-            batch_size = word_indices.size(0)
-        elif batch_size is None:
-            batch_size = 1
+        device = next(self.parameters()).device
+        if input_features is not None:
+            embeds = input_features
+        elif word_indices is not None:
+            embeds = self.word_embedding(word_indices)
+        else:
+            embeds = torch.zeros(batch_size or 1, sequence_length, self.embed_dim, device=device)
 
-        if word_indices is None:
-            # Generate dummy sequence for feature extraction
-            word_indices = torch.zeros(batch_size, sequence_length, dtype=torch.long)
-            word_indices = word_indices.to(next(self.parameters()).device)
+        batch_size, seq_len, _ = embeds.shape
+        positions = torch.arange(seq_len, device=embeds.device).clamp_max(self.max_len - 1)
+        embeds = self.dropout(embeds + self.position_embedding(positions).unsqueeze(0))
 
-        seq_len = word_indices.size(1)
-
-        # Word embeddings
-        word_embeds = self.word_embedding(word_indices)
-
-        # Add positional information based on GRID structure
-        positions = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
-        positions = positions.to(word_indices.device)
-        # Map to GRID positions (cycle through 6 positions)
-        grid_positions = positions % 6
-        pos_embeds = self.position_embedding(grid_positions)
-
-        # Combine embeddings
-        combined_embeds = word_embeds + pos_embeds
-        combined_embeds = self.dropout(combined_embeds)
-
-        # LSTM forward pass
-        lstm_out, _ = self.lstm(combined_embeds)
+        lstm_out, _ = self.lstm(embeds)
         lstm_out = self.dropout(lstm_out)
 
-        # Apply grammar-aware attention
-        attended_out, attention_weights = self.grammar_attention(lstm_out, lstm_out, lstm_out)
-
-        # Combine LSTM output with attended output
+        attended_out, _ = self.grammar_attention(lstm_out, lstm_out, lstm_out)
         language_features = lstm_out + attended_out
 
-        # Generate word probabilities
-        word_probs = self.output_projection(language_features)
-
-        return language_features, word_probs
+        word_logits = self.output_projection(language_features)
+        return language_features, word_logits
 
     def get_grammar_constraints(self, position):
-        """Get valid words for given position in GRID structure"""
+        """Valid words for the given *word* position (0-5) in a GRID sentence"""
         grid_position = position % 6
         if grid_position in self.type_to_words:
             valid_words = self.type_to_words[grid_position]
-            valid_indices = [Config.VOCABULARY.index(word) for word in valid_words
-                             if word in Config.VOCABULARY]
-            return valid_indices
+            return [Config.VOCABULARY.index(word) for word in valid_words if word in Config.VOCABULARY]
         return list(range(self.vocab_size))
 
     def apply_grammar_constraints(self, word_probs, positions):
-        """Apply grammar constraints to word probabilities"""
+        """Apply grammar constraints to word-level (not frame-level) probabilities"""
         batch_size, seq_len, vocab_size = word_probs.shape
         constrained_probs = torch.full_like(word_probs, -float('inf'))
 
@@ -165,7 +146,7 @@ class GRIDLanguageModel(nn.Module):
 
 
 class PhonemeLanguageModel(nn.Module):
-    """Language model for phoneme sequences"""
+    """Context model over a (soft) phoneme sequence"""
 
     def __init__(self,
                  num_phonemes=len(Config.PHONEMES),
@@ -174,11 +155,13 @@ class PhonemeLanguageModel(nn.Module):
         super(PhonemeLanguageModel, self).__init__()
 
         self.num_phonemes = num_phonemes
+        self.embed_dim = embed_dim
 
-        # Phoneme embeddings
         self.phoneme_embedding = nn.Embedding(num_phonemes, embed_dim)
 
-        # Transformer for phoneme sequence modeling
+        # Transformers are order-agnostic without positional information
+        self.pos_encoding = PositionalEncoding(embed_dim, max_len=max(Config.SEQUENCE_LENGTH, 512))
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=8,
@@ -188,51 +171,47 @@ class PhonemeLanguageModel(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
 
-        # Output projection
         self.output_projection = nn.Linear(embed_dim, num_phonemes)
 
-    def forward(self, phoneme_indices=None, sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
+    def forward(self, phoneme_probs=None, phoneme_indices=None,
+                sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
         """
         Args:
-            phoneme_indices: Phoneme indices (batch_size, seq_len) - optional for unconditional generation.
-                Must never be the ground-truth phoneme sequence being predicted elsewhere in the
-                pipeline, since embedding it here would let the model trivially echo the answer.
-            sequence_length: Length of sequence to generate features for, used when phoneme_indices is None
-            batch_size: Batch size to use when phoneme_indices is None (must match the caller's real
-                batch size so downstream concatenation with per-sample features doesn't break)
+            phoneme_probs: soft phoneme distribution per frame (B, T, num_phonemes) — in the full
+                model this is the visual stream's own estimate, never the ground truth.
+            phoneme_indices: hard phoneme indices (B, T), alternative to phoneme_probs.
+            If neither is given an all-zero input is used.
         Returns:
-            phoneme_features: Features (batch_size, seq_len, embed_dim)
-            phoneme_probs: Probabilities (batch_size, seq_len, num_phonemes)
+            phoneme_features: (B, T, embed_dim)
+            phoneme_logits: (B, T, num_phonemes)
         """
-        if phoneme_indices is None:
-            # Generate dummy sequence for feature extraction (mirrors GRIDLanguageModel's
-            # unconditional path) so this branch never depends on the target it's used to predict.
-            if batch_size is None:
-                batch_size = 1
-            phoneme_indices = torch.zeros(batch_size, sequence_length, dtype=torch.long)
-            phoneme_indices = phoneme_indices.to(next(self.parameters()).device)
+        if phoneme_probs is not None:
+            # Expected embedding under the distribution
+            phoneme_embeds = torch.matmul(phoneme_probs, self.phoneme_embedding.weight)
+        else:
+            if phoneme_indices is None:
+                phoneme_indices = torch.zeros(batch_size or 1, sequence_length, dtype=torch.long,
+                                              device=next(self.parameters()).device)
+            phoneme_embeds = self.phoneme_embedding(phoneme_indices)
 
-        # Phoneme embeddings
-        phoneme_embeds = self.phoneme_embedding(phoneme_indices)
+        # PositionalEncoding expects (T, B, E)
+        phoneme_embeds = self.pos_encoding(phoneme_embeds.transpose(0, 1)).transpose(0, 1)
 
-        # Transformer forward
         phoneme_features = self.transformer(phoneme_embeds)
-
-        # Generate phoneme probabilities
-        phoneme_probs = self.output_projection(phoneme_features)
-
-        return phoneme_features, phoneme_probs
+        phoneme_logits = self.output_projection(phoneme_features)
+        return phoneme_features, phoneme_logits
 
 
 class HierarchicalLanguageModel(nn.Module):
+    """Phoneme-level context -> word-level context, combined with cross-attention"""
+
     def __init__(self, vocab_size, phoneme_vocab_size):
         super(HierarchicalLanguageModel, self).__init__()
 
-        # Use your existing models
-        self.word_lm = GRIDLanguageModel(vocab_size=vocab_size)
         self.phoneme_lm = PhonemeLanguageModel(num_phonemes=phoneme_vocab_size)
+        self.word_lm = GRIDLanguageModel(vocab_size=vocab_size)
 
-        # Projection for matching dimensions
+        # Project phoneme features (HIDDEN_DIM) to the word-feature size (HIDDEN_DIM * 2)
         self.phoneme_proj = nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM * 2)
 
         self.cross_attention = nn.MultiheadAttention(
@@ -241,135 +220,77 @@ class HierarchicalLanguageModel(nn.Module):
             batch_first=True
         )
 
-        # src/language_model.py  (inside HierarchicalLanguageModel.__init__)
-        self.fc_out = nn.Linear(Config.HIDDEN_DIM * 2, vocab_size)  # was Config.HIDDEN_DIM
+        self.fc_out = nn.Linear(Config.HIDDEN_DIM * 2, vocab_size)
 
-    def forward(self, word_indices, phoneme_indices, sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
-        # word_features: (B, Lw, Ew)
-        # phoneme_features: (B, Lp, Ep)
-        word_features, word_probs = self.word_lm(word_indices, sequence_length=sequence_length, batch_size=batch_size)  # expected Ew == Config.HIDDEN_DIM*2
-        phoneme_features, phoneme_probs = self.phoneme_lm(phoneme_indices, sequence_length=sequence_length, batch_size=batch_size)  # expected Ep == Config.HIDDEN_DI
+    def forward(self, phoneme_probs=None, sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
+        # Bottom-up: phoneme context first, then word context over the phoneme features
+        phoneme_features, _ = self.phoneme_lm(phoneme_probs=phoneme_probs,
+                                              sequence_length=sequence_length, batch_size=batch_size)
+        word_features, _ = self.word_lm(input_features=phoneme_features)
 
-        # project phoneme features up to match word feature dim
         phoneme_features = self.phoneme_proj(phoneme_features)
-        # now phoneme_features dim == Config.HIDDEN_DIM*2
-        # Ensure batch sizes match by expanding if necessary
-        if word_features.size(0) != phoneme_features.size(0):
-            if word_features.size(0) == 1:
-                word_features = word_features.expand(phoneme_features.size(0), -1, -1)
-            elif phoneme_features.size(0) == 1:
-                phoneme_features = phoneme_features.expand(word_features.size(0), -1, -1)
-            else:
-                raise RuntimeError(
-                    f"Batch size mismatch: words {word_features.size()}, phonemes {phoneme_features.size()}")
-
-        # align both time lengths to the same target
         target_len = max(word_features.size(1), phoneme_features.size(1))
-        word_features = time_match(word_features, target_len)  # (B, target_len, E_word)
-        phoneme_features = time_match(phoneme_features, target_len)  # (B, target_len, E_phoneme_proj)
+        word_features = time_match(word_features, target_len)
+        phoneme_features = time_match(phoneme_features, target_len)
 
-        # make tensors contiguous and float32
-        word_features = word_features.contiguous().float()
-        phoneme_features = phoneme_features.contiguous().float()
-
-        # 🔍 Debug shapes after alignment
-
-        # Ensure attention embed_dim matches actual embedding size
-        attn_embed_dim = self.cross_attention.embed_dim if hasattr(self.cross_attention, "embed_dim") else None
-        actual_dim = word_features.size(-1)
-        if attn_embed_dim is None:
-            attn_embed_dim = getattr(self.cross_attention, "d_model", None)
-
-        if attn_embed_dim != actual_dim:
-            print(f"[HierLM] ⚠️ Attention mismatch: attn_embed_dim={attn_embed_dim}, actual_dim={actual_dim}")
-            if attn_embed_dim is not None:
-                proj_qk = nn.Linear(actual_dim, attn_embed_dim).to(word_features.device)
-                word_features = proj_qk(word_features)
-                proj_v = nn.Linear(actual_dim, attn_embed_dim).to(phoneme_features.device)
-                phoneme_features = proj_v(phoneme_features)
-                actual_dim = attn_embed_dim
-                print(f"[HierLM] projected both features to {attn_embed_dim}")
-            else:
-                raise RuntimeError(f"Attention module embed dim unknown and actual_dim={actual_dim}")
-
-        # Check divisibility by num_heads
-        num_heads = self.cross_attention.num_heads if hasattr(self.cross_attention, "num_heads") else getattr(
-            self.cross_attention, "nhead", None)
-        assert num_heads is not None, "Cannot determine attention num_heads"
-        assert actual_dim % num_heads == 0, f"embed_dim {actual_dim} not divisible by num_heads {num_heads}"
-
-        # Now run attention. MultiheadAttention expects (batch, seq, embed) when batch_first=True
-        attended_phonemes, attn_weights = self.cross_attention(
+        attended_phonemes, _ = self.cross_attention(
             phoneme_features,  # query
             word_features,  # key
             word_features  # value
         )
 
         combined_features = attended_phonemes + word_features
-        output_logits = self.fc_out(combined_features)
-
-        word_probs = F.softmax(output_logits, dim=-1)
+        word_probs = F.softmax(self.fc_out(combined_features), dim=-1)
         return combined_features, word_probs
 
 
-import torch
-import torch.nn as nn
-
 class ContextualLanguageModel(nn.Module):
-    """Hierarchical LM with speaker adaptation"""
+    """Hierarchical LM with speaker adaptation.
 
-    def __init__(self, num_speakers=3, vocab_size=len(Config.VOCABULARY)):
+    Speaker embeddings have one extra "unknown speaker" slot (Config.UNKNOWN_SPEAKER_ID). During
+    training each sample's speaker id is replaced by it with probability Config.SPEAKER_DROPOUT,
+    so that slot is trained and can be used for speakers not seen in training (the usual
+    speaker-independent split, where val/test speakers would otherwise get untrained embeddings).
+    """
 
+    def __init__(self, num_speakers=Config.NUM_SPEAKERS, vocab_size=len(Config.VOCABULARY),
+                 speaker_dropout=Config.SPEAKER_DROPOUT):
         super().__init__()
         self.base_lm = HierarchicalLanguageModel(
             vocab_size=Config.VOCAB_SIZE,
             phoneme_vocab_size=Config.PHONEME_VOCAB_SIZE
         )
 
-        # Speaker embeddings
-        # src/language_model.py  (inside ContextualLanguageModel.__init__)
-        self.speaker_embedding = nn.Embedding(num_speakers, Config.HIDDEN_DIM * 2)  # was HIDDEN_DIM
+        self.unknown_speaker_id = num_speakers
+        self.speaker_dropout = speaker_dropout
+        self.speaker_embedding = nn.Embedding(num_speakers + 1, Config.HIDDEN_DIM * 2)
 
-        # Context adaptation
-        # src/language_model.py  (inside ContextualLanguageModel.__init__)
         self.context_adaptation = nn.Sequential(
             nn.Linear(Config.HIDDEN_DIM * 4, Config.HIDDEN_DIM * 2),  # 1024 -> 512
             nn.ReLU(),
             nn.Linear(Config.HIDDEN_DIM * 2, Config.HIDDEN_DIM * 2)  # 512 -> 512
         )
 
-        # Final classifier after adaptation
-        # src/language_model.py  (inside ContextualLanguageModel.__init__)
-        self.classifier = nn.Linear(Config.HIDDEN_DIM * 2, vocab_size)  # was HIDDEN_DIM
+        self.classifier = nn.Linear(Config.HIDDEN_DIM * 2, vocab_size)
 
-    def forward(self, word_indices=None, phoneme_indices=None,
-                speaker_ids=None, sequence_length=Config.SEQUENCE_LENGTH):
-
-        # Real batch size comes from speaker_ids when word/phoneme indices aren't provided
-        # (the normal case now that this branch never sees the ground-truth phoneme target) —
-        # otherwise the dummy features default to batch_size=1 and break concatenation below.
+    def forward(self, phoneme_probs=None, speaker_ids=None, sequence_length=Config.SEQUENCE_LENGTH):
         batch_size = speaker_ids.size(0) if speaker_ids is not None else None
-
-        # Base hierarchical LM
-        base_features, _ = self.base_lm(word_indices, phoneme_indices, sequence_length=sequence_length, batch_size=batch_size)
+        base_features, _ = self.base_lm(phoneme_probs=phoneme_probs, sequence_length=sequence_length,
+                                        batch_size=batch_size)
 
         if speaker_ids is not None:
-            # Speaker embeddings
+            if self.training and self.speaker_dropout > 0:
+                drop = torch.rand(speaker_ids.shape, device=speaker_ids.device) < self.speaker_dropout
+                speaker_ids = speaker_ids.masked_fill(drop, self.unknown_speaker_id)
+
             speaker_embeds = self.speaker_embedding(speaker_ids)  # (B, H)
+            seq_len = base_features.size(1)
+            speaker_embeds = speaker_embeds.unsqueeze(1).expand(-1, seq_len, -1)
 
-            # Broadcast across sequence
-            batch_size, seq_len, feat_dim = base_features.shape
-            speaker_embeds = speaker_embeds.unsqueeze(1).repeat(1, seq_len, 1)
-
-            # Concatenate and adapt
-            combined = torch.cat([base_features, speaker_embeds], dim=-1)  # (B,L,1024)
-            adapted_features = self.context_adaptation(combined)  # (B,L,512)
-
-
+            combined = torch.cat([base_features, speaker_embeds], dim=-1)  # (B, L, 1024)
+            adapted_features = self.context_adaptation(combined)  # (B, L, 512)
         else:
             adapted_features = base_features
 
-        # Compute new word probabilities from adapted features
-        word_probs = self.classifier(adapted_features)  # (B,L,V)
-
-        return adapted_features, word_probs
+        word_logits = self.classifier(adapted_features)  # (B, L, V)
+        return adapted_features, word_logits

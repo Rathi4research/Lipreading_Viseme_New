@@ -135,11 +135,8 @@ class TransformerSequenceModel(nn.Module):
         x = self.pos_encoding(x)
         x = x.permute(1, 0, 2)  # (batch_size, seq_len, hidden_dim)
 
-        # Create padding mask if not provided
-        if mask is None:
-            mask = torch.zeros(x.shape[0], x.shape[1], dtype=torch.bool, device=x.device)
-
-        # Transformer forward
+        # Transformer forward (mask=None means no padding mask; an all-False mask would be
+        # equivalent but triggers a CPU fallback on MPS)
         hidden = self.transformer(x, src_key_padding_mask=mask)
         hidden = self.dropout(hidden)
 

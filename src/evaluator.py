@@ -6,6 +6,7 @@ import seaborn as sns
 import logging
 import os
 from src.config import Config
+from src.viseme_mapping import viseme_mapper
 
 logger = logging.getLogger(__name__)
 
@@ -18,14 +19,11 @@ class LipReadingEvaluator:
         self.test_loader = test_loader
         self.device = device
         self.results = {}
-        # 'visual_only' skips the language-model branch, which otherwise receives the
-        # ground-truth phoneme sequence as input (models/fusion_network.py forward()) —
-        # using 'full' here would let the model echo the answer key back for phoneme_logits.
-        self.eval_model_type = 'visual_only'
 
     def evaluate_comprehensive(self):
         """Run comprehensive evaluation with adaptive thresholds"""
         logger.info("Starting comprehensive evaluation...")
+        logger.info(f"Evaluating model_type='{self.model.model_type}' (the path it was trained with)")
 
         self.model.eval()
 
@@ -49,24 +47,13 @@ class LipReadingEvaluator:
                 frames = batch['frames'].to(self.device)
                 visemes = batch['visemes'].to(self.device)
                 phonemes = batch['phonemes'].to(self.device)
+                # Ground-truth ambiguity: used only to bucket the results below, never a model input
                 ambiguity_scores = batch['ambiguity_scores'].to(self.device)
 
-                # Speaker mapping
-                speaker_ids = torch.tensor([
-                    Config.SPEAKER_TO_ID.get(s, 0)
-                    for s in batch['subjects']
-                ]).to(self.device)
+                speaker_ids = self.model.speaker_ids_for(batch['subjects'], self.device)
 
-                # Forward pass — model_type='visual_only' so the language-model branch
-                # (which otherwise takes the ground-truth phoneme sequence as input) is
-                # skipped, giving an honest measure of what the visual pipeline learned.
-                predictions = self.model(
-                    frames=frames,
-                    phoneme_targets=phonemes,
-                    speaker_ids=speaker_ids,
-                    ambiguity_scores=ambiguity_scores,
-                    model_type=self.eval_model_type
-                )
+                # Forward pass with the model's own model_type; only frames + speakers go in
+                predictions = self.model(frames=frames, speaker_ids=speaker_ids)
 
                 # Get predictions
                 viseme_preds = torch.argmax(predictions['viseme_logits'], dim=-1)
@@ -151,9 +138,19 @@ class LipReadingEvaluator:
         print(
             f"  High ambiguity: ≥ {high_threshold:.4f} ({high_amb_total} samples, {100 * high_amb_total / total_samples:.1f}%)")
 
-        # Generate confusion matrices
-        viseme_cm = confusion_matrix(all_viseme_targets, all_viseme_preds)
-        phoneme_cm = confusion_matrix(all_phoneme_targets, all_phoneme_preds)
+        # Generate confusion matrices over the full label sets (fixed shape, so plot labels line
+        # up even when some classes never occur in this test set)
+        viseme_cm = confusion_matrix(all_viseme_targets, all_viseme_preds,
+                                     labels=list(range(self.model.num_visemes)))
+        phoneme_cm = confusion_matrix(all_phoneme_targets, all_phoneme_preds,
+                                      labels=list(range(self.model.num_phonemes)))
+
+        # Speech-only accuracy (exclude silence frames, which dominate GRID clips)
+        silence_viseme = viseme_mapper.get_viseme('sil')
+        speech = all_viseme_targets != silence_viseme
+        speech_total = int(speech.sum())
+        speech_viseme_acc = float((all_viseme_preds[speech] == all_viseme_targets[speech]).mean()) if speech_total else 0.0
+        speech_phoneme_acc = float((all_phoneme_preds[speech] == all_phoneme_targets[speech]).mean()) if speech_total else 0.0
 
         # Calculate per-class accuracies. A row sum of 0 means that class never appeared
         # in the targets, so accuracy is undefined (not 0) — leave those classes as nan
@@ -173,7 +170,10 @@ class LipReadingEvaluator:
             'accuracy_metrics': {
                 'viseme_accuracy': correct_visemes / total_samples if total_samples > 0 else 0.0,
                 'phoneme_accuracy': correct_phonemes / total_samples if total_samples > 0 else 0.0,
-                'total_samples': total_samples
+                'speech_viseme_accuracy': speech_viseme_acc,
+                'speech_phoneme_accuracy': speech_phoneme_acc,
+                'total_samples': total_samples,
+                'speech_samples': speech_total
             },
             'ambiguity_analysis': {
                 'high_ambiguity_accuracy': high_amb_correct / high_amb_total if high_amb_total > 0 else 0.0,
@@ -217,6 +217,8 @@ class LipReadingEvaluator:
         print(f"{'=' * 70}")
         print(f"Overall Viseme Accuracy: {results['accuracy_metrics']['viseme_accuracy']:.4f}")
         print(f"Overall Phoneme Accuracy: {results['accuracy_metrics']['phoneme_accuracy']:.4f}")
+        print(f"Speech-only Viseme Accuracy: {speech_viseme_acc:.4f}  ({speech_total} non-silence frames)")
+        print(f"Speech-only Phoneme Accuracy: {speech_phoneme_acc:.4f}")
         print(f"\nAccuracy by Ambiguity Level:")
         print(f"  Low  ({low_amb_total:6d} samples): {results['ambiguity_analysis']['low_ambiguity_accuracy']:.4f}")
         print(f"  Mid  ({mid_amb_total:6d} samples): {results['ambiguity_analysis']['mid_ambiguity_accuracy']:.4f}")
@@ -398,7 +400,10 @@ class LipReadingEvaluator:
         report_lines.append("-" * 40)
         report_lines.append(f"Viseme Accuracy: {acc_metrics['viseme_accuracy']:.4f}")
         report_lines.append(f"Phoneme Accuracy: {acc_metrics['phoneme_accuracy']:.4f}")
-        report_lines.append(f"Total Test Samples: {acc_metrics['total_samples']:,}")
+        report_lines.append(f"Speech-only Viseme Accuracy: {acc_metrics['speech_viseme_accuracy']:.4f}")
+        report_lines.append(f"Speech-only Phoneme Accuracy: {acc_metrics['speech_phoneme_accuracy']:.4f}")
+        report_lines.append(f"Total Test Frames: {acc_metrics['total_samples']:,} "
+                            f"({acc_metrics['speech_samples']:,} non-silence)")
         report_lines.append("")
 
         # Ambiguity analysis

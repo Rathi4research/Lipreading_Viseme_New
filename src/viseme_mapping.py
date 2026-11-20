@@ -1,5 +1,6 @@
 import numpy as np
 from collections import defaultdict
+from src.config import Config
 
 
 class VisemeMapper:
@@ -68,23 +69,26 @@ class VisemeMapper:
         return scores
 
     def _create_confusion_matrix(self):
-        """Create confusion matrix for phoneme-viseme disambiguation"""
-        num_phonemes = len(self.phoneme_to_viseme)
-        phoneme_to_idx = {p: i for i, p in enumerate(self.phoneme_to_viseme.keys())}
+        """Prior P(phoneme | viseme) as a (num_visemes, len(Config.PHONEMES)) matrix.
 
-        # Initialize confusion matrix
-        confusion = np.zeros((self.num_visemes, num_phonemes))
+        Columns follow Config.PHONEMES — the same index space as the phoneme targets produced by
+        the data loader and the decoder's output — so the prior lines up with the labels.
+        Each row spreads its mass uniformly over the phonemes (in Config.PHONEMES) of that viseme.
+        """
+        phonemes = Config.PHONEMES
+        phoneme_to_idx = {p: i for i, p in enumerate(phonemes)}
 
-        # Fill confusion matrix with probabilities
+        confusion = np.zeros((self.num_visemes, len(phonemes)))
         for viseme_id in range(self.num_visemes):
-            phonemes_in_viseme = self.viseme_to_phonemes[viseme_id]
-            prob_per_phoneme = 1.0 / len(phonemes_in_viseme) if phonemes_in_viseme else 0.0
-
-            for phoneme in phonemes_in_viseme:
-                phoneme_idx = phoneme_to_idx[phoneme]
-                confusion[viseme_id, phoneme_idx] = prob_per_phoneme
+            members = [p for p in self.viseme_to_phonemes[viseme_id] if p in phoneme_to_idx]
+            for phoneme in members:
+                confusion[viseme_id, phoneme_to_idx[phoneme]] = 1.0 / len(members)
 
         return confusion, phoneme_to_idx
+
+    def ambiguity_lookup(self):
+        """Ambiguity score per viseme id as a list indexable by viseme id (for vectorized lookup)."""
+        return [self.get_ambiguity_score(v) for v in range(self.num_visemes)]
 
     def get_viseme(self, phoneme):
         """Get viseme ID for a phoneme"""

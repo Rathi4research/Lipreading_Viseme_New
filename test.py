@@ -1,206 +1,128 @@
-import torch
-import torch.nn.functional as F
-import cv2
-import numpy as np
+"""Manual single-utterance test of a trained checkpoint.
+
+Usage:
+    python test.py <checkpoint.pth> <input>
+
+<input> is either a preprocessed lip-crop .npy (from scripts/preprocess.py, preferred) or a raw
+GRID video (.mpg/.mp4), which is lip-cropped the same way as in preprocessing (needs dlib and
+shape_predictor_68_face_landmarks.dat). Feeding whole, uncropped frames would not match what the
+model was trained on.
+"""
 import os
 import sys
 
-# Add src to path for imports
-sys.path.append('src')
-sys.path.append('models')
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-from src.config import Config
-from models.fusion_network import VisemePhonemeAdaptiveModel
-from models.visual_encoder import materialize_lazy_layers
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from src.config import Config, detect_device
+from models.fusion_network import ModelFactory
 
 
 def load_model(model_path):
-    """Load the trained model"""
+    """Load a trained model (model_type, frame size and known speakers come from the checkpoint)"""
     print(f"Loading model from: {model_path}")
-
     if not os.path.exists(model_path):
-        print(f"❌ Model file not found: {model_path}")
+        print(f"Model file not found: {model_path}")
         return None
 
-    model = VisemePhonemeAdaptiveModel()
-
-    try:
-        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-
-        # Handle different checkpoint formats
-        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-        # Create lazily-built visual encoder layers so their trained weights are loaded
-        materialize_lazy_layers(model, state_dict)
-
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(state_dict, strict=False)
-            if 'epoch' in checkpoint:
-                print(f"✅ Loaded model from epoch {checkpoint['epoch']}")
-        else:
-            model.load_state_dict(checkpoint)
-
-        model.eval()
-        print("✅ Model loaded successfully!")
-        return model
-
-    except Exception as e:
-        print(f"❌ Error loading model: {e}")
-        return None
-
-
-def process_video(video_path):
-    """Process video and extract frames"""
-    print(f"Processing video: {video_path}")
-
-    if not os.path.exists(video_path):
-        print(f"❌ Video file not found: {video_path}")
-        return None
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"❌ Cannot open video: {video_path}")
-        return None
-
-    frames = []
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"📹 Video: {total_frames} frames, {fps:.1f} FPS")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Convert to grayscale
-        if len(frame.shape) == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Resize to model input size
-        frame = cv2.resize(frame, (Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
-
-        # Normalize to [0, 1]
-        frame = frame.astype(np.float32) / 255.0
-        frames.append(frame)
-
-    cap.release()
-
-    if len(frames) == 0:
-        print("❌ No frames extracted from video")
-        return None
-
-    print(f"📹 Extracted {len(frames)} frames")
-
-    frames = np.array(frames)
-
-    # Handle sequence length
-    if len(frames) > Config.SEQUENCE_LENGTH:
-        start_idx = (len(frames) - Config.SEQUENCE_LENGTH) // 2
-        frames = frames[start_idx:start_idx + Config.SEQUENCE_LENGTH]
-        print(f"⚠️  Trimmed to {Config.SEQUENCE_LENGTH} frames")
-    elif len(frames) < Config.SEQUENCE_LENGTH:
-        last_frame = frames[-1]
-        padding_needed = Config.SEQUENCE_LENGTH - len(frames)
-        padding = np.tile(last_frame[np.newaxis, :, :], (padding_needed, 1, 1))
-        frames = np.concatenate([frames, padding], axis=0)
-        print(f"📝 Padded to {Config.SEQUENCE_LENGTH} frames")
-
-    # Add batch dimension: (1, seq_len, height, width)
-    video_tensor = torch.FloatTensor(frames).unsqueeze(0)
-
-    return video_tensor
-
-
-def predict_sentence(model, video_tensor):
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+    model = ModelFactory.load_pretrained_model(model_path)  # also applies the checkpoint's frame size
     model.eval()
-    with torch.no_grad():
-        # Correct shape unpacking
-        batch, seq_len, height, width = video_tensor.shape
-
-        pad_idx = 0
-        phoneme_targets = torch.full((batch, seq_len), pad_idx, dtype=torch.long)
-        word_targets    = torch.full((batch, seq_len), pad_idx, dtype=torch.long)
-
-        outputs = model(
-            video_tensor,
-            phoneme_targets,   # phoneme_targets
-            word_targets,      # word_targets
-            None,              # speaker_ids
-            None               # ambiguity_scores
-        )
-
-        viseme_logits  = outputs['viseme_logits']
-        phoneme_logits = outputs['phoneme_logits']
-
-        # Simple prediction
-        phoneme_preds = torch.argmax(phoneme_logits, dim=-1)
-
-        # Dummy confidence placeholders for now
-        return phoneme_preds, 0.0, []
+    print(f"Loaded '{model.model_type}' model (epoch {checkpoint.get('epoch', -1) + 1}, "
+          f"frames {Config.FRAME_HEIGHT}x{Config.FRAME_WIDTH})")
+    return model
 
 
+def load_input(path, landmarks='shape_predictor_68_face_landmarks.dat'):
+    """Return lip-crop frames as a (1, T, 1, H, W) tensor padded/truncated to SEQUENCE_LENGTH"""
+    if not os.path.exists(path):
+        print(f"Input not found: {path}")
+        return None, 0
 
-def test_video_prediction(model_path, video_path):
-    """Main function to test video prediction"""
-    print("🎬 Manual Video Prediction Test")
-    print("=" * 50)
-
-    model = load_model(model_path)
-    if model is None:
-        return
-
-    video_tensor = process_video(video_path)
-    if video_tensor is None:
-        return
-
-    predicted_sentence, avg_confidence, confidence_scores = predict_sentence(model, video_tensor)
-
-    print("\n🎯 PREDICTION RESULTS:")
-    print("=" * 50)
-    print(f"📹 Video: {os.path.basename(video_path)}")
-    print(f"🗣️  Predicted Sentence: '{predicted_sentence}'")
-    print(f"📊 Average Confidence: {avg_confidence:.3f}")
-    print(f"📊 Word Confidences: {[f'{c:.3f}' for c in confidence_scores]}")
-
-    if avg_confidence > 0.8:
-        print("✅ High confidence prediction!")
-    elif avg_confidence > 0.6:
-        print("⚠️  Medium confidence prediction")
+    if path.endswith('.npy'):
+        frames = np.load(path)
     else:
-        print("❌ Low confidence prediction")
+        from scripts import preprocess
+        if preprocess.dlib is None:
+            print("dlib is required to crop raw video; use a preprocessed .npy instead")
+            return None, 0
+        preprocess._init_worker(landmarks)
+        frames = preprocess.extract_lip_sequence(path, size=Config.FRAME_HEIGHT,
+                                                 max_frames=Config.SEQUENCE_LENGTH)
+        frames = np.asarray(frames, dtype=np.float32) / 255.0
 
+    video = torch.tensor(frames, dtype=torch.float32).unsqueeze(1)  # (T, 1, H, W)
+    num_valid = min(video.shape[0], Config.SEQUENCE_LENGTH)
+    video = video[:Config.SEQUENCE_LENGTH]
+    if video.shape[0] < Config.SEQUENCE_LENGTH:
+        pad = torch.zeros(Config.SEQUENCE_LENGTH - video.shape[0], *video.shape[1:])
+        video = torch.cat([video, pad], dim=0)
+    if video.shape[-2:] != (Config.FRAME_HEIGHT, Config.FRAME_WIDTH):
+        video = F.interpolate(video, size=(Config.FRAME_HEIGHT, Config.FRAME_WIDTH),
+                              mode='bilinear', align_corners=False)
+    return video.unsqueeze(0), num_valid
+
+
+def collapse(labels):
+    """Merge consecutive repeats and drop silence"""
+    out = []
+    for label in labels:
+        if not out or out[-1] != label:
+            out.append(label)
+    return [label for label in out if label not in ('sil', 'V11')]
+
+
+def predict(model, video, num_valid, speaker=None):
+    device = next(model.parameters()).device
+    speaker_ids = model.speaker_ids_for([speaker or 'unknown'], device)
+    preds = model.predict(video.to(device), speaker_ids=speaker_ids)
+
+    phoneme_ids = preds['phoneme_predictions'][0, :num_valid].tolist()
+    viseme_ids = preds['viseme_predictions'][0, :num_valid].tolist()
+    confidence = preds['phoneme_probabilities'][0, :num_valid].max(dim=-1).values.mean().item()
+
+    phonemes = collapse([Config.PHONEMES[i] for i in phoneme_ids])
+    visemes = collapse([f"V{i}" for i in viseme_ids])
+    return phonemes, visemes, confidence
+
+
+def test_prediction(model, input_path, speaker=None):
+    video, num_valid = load_input(input_path)
+    if video is None:
+        return
+    phonemes, visemes, confidence = predict(model, video, num_valid, speaker)
+
+    print("\nPREDICTION RESULTS")
+    print("=" * 50)
+    print(f"Input: {os.path.basename(input_path)} ({num_valid} frames)")
+    print(f"Phonemes: {' '.join(phonemes)}")
+    print(f"Visemes:  {' '.join(visemes)}")
+    print(f"Mean per-frame phoneme confidence: {confidence:.3f}")
     print("=" * 50)
 
 
 if __name__ == "__main__":
-    MODEL_PATH = r"D:\lip_reading_project\checkpoints\best_model.pth"   # Change if needed
-    VIDEO_PATH = r"D:\lip_reading_project\data\videos\s1\bbaf2n.mpg"    # Change if needed
-
-    if len(sys.argv) >= 3:
-        MODEL_PATH = sys.argv[1]
-        VIDEO_PATH = sys.argv[2]
-    elif len(sys.argv) == 2:
-        print("Usage: python test.py <model_path> <video_path>")
+    if len(sys.argv) < 3:
+        print(__doc__)
         sys.exit(1)
 
-    print(f"Model: {MODEL_PATH}")
-    print(f"Video: {VIDEO_PATH}")
-    print()
+    model_path, input_path = sys.argv[1], sys.argv[2]
+    speaker = sys.argv[3] if len(sys.argv) > 3 else None  # optional, e.g. s1
 
-    test_video_prediction(MODEL_PATH, VIDEO_PATH)
+    Config.DEVICE = detect_device()
+    model = load_model(model_path)
+    if model is None:
+        sys.exit(1)
+    model.to(Config.DEVICE)
 
-    # Option to test multiple videos interactively
-    while True:
-        print("\n" + "=" * 50)
-        choice = input("🎬 Test another video? (y/n): ").lower().strip()
+    test_prediction(model, input_path, speaker)
 
-        if choice in ['y', 'yes']:
-            new_video = input("📹 Enter video path: ").strip()
-            if os.path.exists(new_video):
-                test_video_prediction(MODEL_PATH, new_video)
-            else:
-                print(f"❌ Video not found: {new_video}")
-        elif choice in ['n', 'no']:
-            print("👋 Goodbye!")
+    while sys.stdin.isatty():
+        choice = input("\nTest another input? (y/n): ").lower().strip()
+        if choice in ('y', 'yes'):
+            test_prediction(model, input("Path to .npy or video: ").strip(), speaker)
+        elif choice in ('n', 'no'):
             break
-        else:
-            print("Please enter 'y' or 'n'")

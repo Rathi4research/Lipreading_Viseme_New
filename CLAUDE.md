@@ -20,7 +20,7 @@ pip install -r requirements.txt
 # dlib is only needed for scripts/preprocess.py (and the slow on-the-fly fallback in the data loader)
 
 # Pre-extract lip crops once (parallel dlib) -> data/preprocessed_lips/<speaker>/<utt>.npy
-python scripts/preprocess.py --speakers s1 s2 s3 --size 80 [--backup-dir <drive folder>]
+python scripts/preprocess.py --speakers s1 s2 s3 --size 80 [--crop-mode square|tight] [--backup-dir <drive folder>]
 
 # Train (mode is positional; subjects/model-type/etc. are flags)
 python main.py train --model-type full --frame-size 80 --train-subjects s1 --val-subjects s2 --test-subjects s3
@@ -40,11 +40,11 @@ python main.py inference --checkpoint-path checkpoints/best_model.pth
 # Print dataset statistics (frame/sequence shapes, viseme distribution, etc.)
 python main.py analyze
 
-# Generate placeholder sample data/directories for smoke-testing the pipeline
-python main.py create_sample
+# Generate a tiny synthetic dataset (GRID-format .align + random .npy) for smoke-testing
+python main.py create_sample --data-dir /tmp/smoke_data --frame-size 80
 
-# Standalone manual test of a single video against a checkpoint
-python test.py <model_path> <video_path>
+# Standalone test of one utterance (.npy lip crops, or raw video if dlib is installed)
+python test.py <checkpoint.pth> <file.npy|video> [speaker]
 ```
 
 `main_old.py` is a stale duplicate of `main.py` — prefer `main.py`. `src/trainer.py` also has its own
@@ -78,57 +78,61 @@ utterance has no `.npy`, the raw video is cropped on the fly with dlib (slow; ne
 
 ## Architecture
 
-Data flows through five stages, wired together in `VisemePhonemeAdaptiveModel`
-(`models/fusion_network.py`), the single top-level `nn.Module`:
+Data flows through these stages, wired together in `VisemePhonemeAdaptiveModel`
+(`models/fusion_network.py`), the single top-level `nn.Module`. Only frames and speaker ids are model
+inputs — nothing derived from the targets (phonemes, words, ground-truth ambiguity) may be fed in.
 
 1. **Visual encoding** (`models/visual_encoder.py`) — `EnhancedVisualEncoder` = `LipROI` (a 2D
-   spatial-attention gate applied per-frame) → `VisualEncoder` (4-block 3D CNN over the frame sequence,
-   flattened and projected to `Config.VISUAL_FEATURE_DIM`-dim per-frame features). Note `VisualEncoder`
-   builds `fc1`/`fc2` from a dummy forward pass at init but then lazily rebuilds `fc1_dynamic`/
-   `fc2_dynamic` on first real forward call if the flattened conv size differs — the static `fc1`/`fc2`
-   layers end up unused dead weights.
+   spatial-attention gate applied per-frame) → `VisualEncoder` (4-block 3D CNN; pooling is spatial only,
+   so all `SEQUENCE_LENGTH` frames keep their own feature vector) → per-frame `fc1`/`fc2` projection to
+   `Config.VISUAL_FEATURE_DIM`. All layers are built in `__init__` (sized from `Config.FRAME_*` at
+   construction time). `upgrade_legacy_state_dict` maps old checkpoints (`fc1_dynamic`) onto this layout.
 
-2. **Sequence modeling** (`models/sequence_model.py`) — `HybridSequenceModel` runs an `LSTMSequenceModel`
-   over the visual features, concatenates the LSTM hidden state back with the original features, then
-   feeds that through a `TransformerSequenceModel` (with sinusoidal positional encoding) to produce the
-   final per-frame hidden representation (`Config.HIDDEN_DIM`-dim) and viseme logits.
+2. **Sequence modeling** (`models/sequence_model.py`) — `HybridSequenceModel` (LSTM → concat with input →
+   Transformer with sinusoidal positions) gives per-frame hidden features (`Config.HIDDEN_DIM`) and its own
+   *auxiliary* viseme logits, trained with `aux_viseme_loss` (`Config.AUX_VISEME_LOSS_WEIGHT`). The
+   detached aux viseme distribution drives the ambiguity scores and the language-model input below.
 
-3. **Language modeling** (`src/language_model.py`) — only invoked when `model_type='full'`.
-   `ContextualLanguageModel` wraps `HierarchicalLanguageModel` (a `GRIDLanguageModel` word LSTM, whose
-   position embeddings encode the fixed GRID sentence grammar `[command][color][preposition][letter]
-   [digit][adverb]`, cross-attended with a `PhonemeLanguageModel` transformer) and adapts it with a
-   per-speaker embedding (`speaker_ids` ∈ {s1, s2, s3} → {0, 1, 2}, hardcoded in `main.py`/`src/trainer.py`).
+3. **Language modeling** (`src/language_model.py`) — runs for `model_type` `full` and `baseline`. Input is
+   the model's own soft phoneme estimate (aux viseme probs × viseme→phoneme prior), never the ground truth.
+   `ContextualLanguageModel` wraps `HierarchicalLanguageModel` (`PhonemeLanguageModel` transformer with
+   positional encoding → `GRIDLanguageModel` word LSTM with absolute frame-position embeddings,
+   cross-attended) and adds a speaker embedding. Speakers come from `model.speaker_ids_for(subjects)`;
+   speakers not in `model.known_speakers` (the training speakers, stored in checkpoints) use the extra
+   `Config.UNKNOWN_SPEAKER_ID` slot, which is trained via `Config.SPEAKER_DROPOUT`. Its per-frame word
+   logits are trained with `word_loss` against per-frame word labels.
 
-4. **Adaptive fusion** (`src/adaptive_fusion.py`) — `MultiScaleAdaptiveFusion` runs the same
-   `AdaptiveFusionModule` at 4 temporal pooling scales (1/3/5/7 frames), each gating visual vs. language
-   features per-timestep based on the timestep's ambiguity score (via a small `ambiguity_gate` MLP), then
-   combines the 4 scale outputs with a learned scale-attention. Ambiguity scores come from
-   `viseme_mapper.get_ambiguity_score` (higher when a viseme maps to more phonemes) and are computed
-   automatically from predicted visemes if not supplied.
+4. **Fusion** (`src/adaptive_fusion.py`) — `full`: `MultiScaleAdaptiveFusion` runs `AdaptiveFusionModule`
+   at 4 temporal scales (1/3/5/7 frames), gating visual vs. language features per frame from the ambiguity
+   score (expected `viseme_mapper` ambiguity under the aux viseme distribution), combined by learned
+   scale-attention; output (num_visemes) → `fused_proj` → HIDDEN_DIM. `baseline`: plain `static_fusion`
+   (concat → linear). `visual_only`: no language model, sequence features used directly.
 
-5. **Viseme→phoneme decoding** (`src/adaptive_fusion.py`) — `ConfusionMatrixDecoder` starts from the
-   static phoneme→viseme confusion matrix (`src/viseme_mapping.py`, 12 visemes total, indices 0–11), adds
-   a learnable adjustment, converts fused viseme probabilities to phoneme probabilities via matrix
-   multiply, then refines them with a small phoneme-sequence BiLSTM.
+5. **Viseme→phoneme decoding** (`src/adaptive_fusion.py`) — `ConfusionMatrixDecoder`: prior
+   P(phoneme | viseme) from `viseme_mapper.confusion_matrix` (12 × len(`Config.PHONEMES`), columns in
+   `Config.PHONEMES` order = target indices), adjusted in log space by a learnable matrix; viseme probs ×
+   prior gives phoneme probs, and a BiLSTM adds a zero-initialised residual correction to their logs.
 
 `src/viseme_mapping.py` (`viseme_mapper`, a module-level singleton) is the shared source of truth for the
-phoneme↔viseme mapping and ambiguity scores; it's imported by the data loader, the fusion model, and the
-adaptive fusion decoder alike — treat it as canonical rather than re-deriving mappings elsewhere.
+phoneme↔viseme mapping and ambiguity scores; treat it as canonical rather than re-deriving mappings.
 
-`ModelFactory` (`models/fusion_network.py`) builds three model variants from the same class:
-`baseline` (adaptive fusion replaced with `nn.Identity`, so `fused_output` skips fusion but still expects
-`Config.HIDDEN_DIM`-shaped input — this variant is currently broken since `AdaptiveFusionModule`'s output
-projects to `num_visemes`, not `HIDDEN_DIM`), `visual_only` (language loss weight zeroed but the language
-model still runs), and `full` (default).
+`model_type` (`full` / `baseline` / `visual_only`, built via `ModelFactory.create`) is stored on the
+model and in checkpoints; training, resume (`load_checkpoint` refuses a mismatch) and evaluation
+(`load_pretrained_model` uses the checkpoint's type and frame size) all run the same path.
+
+Labels: the data loader returns per-frame `phonemes`, `visemes`, `word_labels` (padding frames past the
+end of the video = -1, ignored everywhere) and ground-truth `ambiguity_scores` (metrics only).
 
 `src/trainer.py`'s `LipReadingTrainer` handles the training loop, TensorBoard logging (`runs/`),
-checkpointing (`checkpoints/`, gradient clipping at norm 1.0, `ReduceLROnPlateau`, early stopping via
-`Config.PATIENCE`), and a final test-set evaluation broken down by high/low ambiguity
-(`Config.AMBIGUITY_THRESHOLD`). `src/evaluator.py`'s `LipReadingEvaluator` is the more comprehensive
-standalone evaluation path used by `main.py evaluate`, producing confusion matrix plots (`plots/`) and a
-text report (`results/`).
+checkpointing (see the checkpoint directory flags above; gradient clipping at norm 1.0,
+`ReduceLROnPlateau`, early stopping via `Config.PATIENCE`) and a final test evaluation of the **best**
+checkpoint. Metrics are reported on all valid frames and on speech-only frames (silence excluded, since
+it dominates GRID clips), plus a high/low ground-truth-ambiguity split. `src/evaluator.py`'s
+`LipReadingEvaluator` is the more comprehensive standalone path used by `main.py evaluate`, producing
+confusion matrix plots (`plots/`) and a text report (`results/`).
 
 All tunable constants (paths, model dims, video/frame params, training hyperparameters, the GRID
 vocabulary/phoneme set) live in one place: `src/config.py`'s `Config` class (accessed as class attributes,
-not instantiated). `Config.DEVICE` is mutated at runtime by `main.py` based on `--device`/CUDA
-availability — code elsewhere reads `Config.DEVICE` live rather than capturing it at import time.
+not instantiated). `main.py` mutates `Config` at runtime from CLI flags (`DEVICE`, `BATCH_SIZE`,
+`FRAME_*`, data paths, ...) before building datasets/models, so code reads `Config` at call/construction
+time rather than capturing values at import time.

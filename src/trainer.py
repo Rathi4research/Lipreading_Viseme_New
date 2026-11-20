@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import csv
@@ -11,14 +10,16 @@ from tqdm import tqdm
 import logging
 from src.config import Config
 
-from models.fusion_network import VisemePhonemeAdaptiveModel
-from models.visual_encoder import materialize_lazy_layers
+from models.fusion_network import VisemePhonemeAdaptiveModel, ModelFactory
+from models.visual_encoder import upgrade_legacy_state_dict
 from src.data_loader import create_data_loaders
 from src.viseme_mapping import viseme_mapper
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+SILENCE_VISEME = viseme_mapper.get_viseme('sil')
 
 
 class EarlyStopping:
@@ -41,14 +42,71 @@ class EarlyStopping:
                 self.early_stop = True
 
 
+class AccuracyMeter:
+    """Frame-level viseme/phoneme accuracy over valid (non-padding) frames.
+
+    Also reports accuracy on speech frames only (target viseme != silence): silence is a large
+    share of every GRID clip and easy to predict, so all-frame accuracy alone overstates how well
+    speech is being read. Optional ground-truth ambiguity scores give a high/low ambiguity split
+    (analysis only — they are never fed to the model).
+    """
+
+    def __init__(self):
+        self.counts = {k: 0 for k in ('total', 'viseme', 'phoneme', 'speech_total', 'speech_viseme',
+                                      'speech_phoneme', 'high_total', 'high_phoneme', 'low_total',
+                                      'low_phoneme')}
+
+    def update(self, viseme_logits, phoneme_logits, visemes, phonemes, ambiguity_scores=None):
+        viseme_ok = torch.argmax(viseme_logits, dim=-1) == visemes
+        phoneme_ok = torch.argmax(phoneme_logits, dim=-1) == phonemes
+        valid = (visemes != -1) & (phonemes != -1)
+        speech = valid & (visemes != SILENCE_VISEME)
+
+        c = self.counts
+        c['total'] += valid.sum().item()
+        c['viseme'] += viseme_ok[valid].sum().item()
+        c['phoneme'] += phoneme_ok[valid].sum().item()
+        c['speech_total'] += speech.sum().item()
+        c['speech_viseme'] += viseme_ok[speech].sum().item()
+        c['speech_phoneme'] += phoneme_ok[speech].sum().item()
+        if ambiguity_scores is not None:
+            high = valid & (ambiguity_scores > Config.AMBIGUITY_THRESHOLD)
+            low = valid & (ambiguity_scores <= Config.AMBIGUITY_THRESHOLD)
+            c['high_total'] += high.sum().item()
+            c['high_phoneme'] += phoneme_ok[high].sum().item()
+            c['low_total'] += low.sum().item()
+            c['low_phoneme'] += phoneme_ok[low].sum().item()
+
+    @staticmethod
+    def _ratio(num, den):
+        return num / den if den > 0 else 0.0
+
+    def results(self):
+        c = self.counts
+        return {
+            'viseme_accuracy': self._ratio(c['viseme'], c['total']),
+            'phoneme_accuracy': self._ratio(c['phoneme'], c['total']),
+            'speech_viseme_accuracy': self._ratio(c['speech_viseme'], c['speech_total']),
+            'speech_phoneme_accuracy': self._ratio(c['speech_phoneme'], c['speech_total']),
+            'high_ambiguity_accuracy': self._ratio(c['high_phoneme'], c['high_total']),
+            'low_ambiguity_accuracy': self._ratio(c['low_phoneme'], c['low_total']),
+            'total_frames': c['total'],
+            'speech_frames': c['speech_total'],
+        }
+
+
 class LipReadingTrainer:
     """Training class for the viseme-phoneme adaptive model"""
 
+    LOSS_KEYS = ('total_loss', 'viseme_loss', 'aux_viseme_loss', 'phoneme_loss', 'word_loss', 'fusion_reg')
+
     METRIC_FIELDS = [
         'epoch', 'lr', 'epoch_seconds',
-        'train_total_loss', 'train_viseme_loss', 'train_phoneme_loss', 'train_fusion_reg',
-        'val_total_loss', 'val_viseme_loss', 'val_phoneme_loss',
+        'train_total_loss', 'train_viseme_loss', 'train_aux_viseme_loss', 'train_phoneme_loss',
+        'train_word_loss', 'train_fusion_reg',
+        'val_total_loss', 'val_viseme_loss', 'val_aux_viseme_loss', 'val_phoneme_loss', 'val_word_loss',
         'val_viseme_accuracy', 'val_phoneme_accuracy',
+        'val_speech_viseme_accuracy', 'val_speech_phoneme_accuracy',
     ]
 
     def __init__(self, model, train_loader, val_loader, test_loader=None, checkpoint_dir=None):
@@ -56,6 +114,9 @@ class LipReadingTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
+
+        # Speakers seen in training; other speakers use the "unknown speaker" embedding
+        self.model.known_speakers = list(getattr(train_loader.dataset, 'subjects', []))
 
         # Where checkpoints, the per-epoch metrics CSV and the test results JSON are written.
         # Defaults to Config.CHECKPOINT_DIR (Google Drive on Colab); main.py --local-checkpoints
@@ -78,7 +139,6 @@ class LipReadingTrainer:
             mode='min',
             factor=0.5,
             patience=5,
-
         )
 
         # Early stopping
@@ -93,7 +153,8 @@ class LipReadingTrainer:
         self.best_val_loss = float('inf')
         self.epoch = 0
 
-        logger.info(f"Trainer initialized. Model has {self._count_parameters()} parameters.")
+        logger.info(f"Trainer initialized. Model type: {self.model.model_type}, "
+                    f"{self._count_parameters():,} trainable parameters, known speakers: {self.model.known_speakers}")
         logger.info(f"Training on {len(train_loader)} batches, validating on {len(val_loader)} batches.")
         logger.info(f"Checkpoints and metrics will be written to: {os.path.abspath(self.checkpoint_dir)}")
 
@@ -106,63 +167,58 @@ class LipReadingTrainer:
         """Count trainable parameters in model"""
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
+    def _run_batch(self, batch):
+        """Forward pass + losses for one batch. Only frames and speakers go into the model."""
+        frames = batch['frames'].to(Config.DEVICE)
+        targets = {
+            'visemes': batch['visemes'].to(Config.DEVICE),
+            'phonemes': batch['phonemes'].to(Config.DEVICE),
+            'words': batch['word_labels'].to(Config.DEVICE),
+        }
+        speaker_ids = self.model.speaker_ids_for(batch['subjects'], Config.DEVICE)
+
+        predictions = self.model(frames=frames, speaker_ids=speaker_ids)
+        losses = self.model.compute_loss(predictions, targets)
+        return predictions, targets, losses
+
+    def _evaluate_loader(self, loader, desc):
+        """Average losses and accuracy metrics over a loader (no grad)."""
+        self.model.eval()
+        epoch_losses = {k: [] for k in self.LOSS_KEYS}
+        meter = AccuracyMeter()
+
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=desc):
+                predictions, targets, losses = self._run_batch(batch)
+                for key, value in losses.items():
+                    if key in epoch_losses:
+                        epoch_losses[key].append(value.item())
+                meter.update(predictions['viseme_logits'], predictions['phoneme_logits'],
+                             targets['visemes'], targets['phonemes'],
+                             batch['ambiguity_scores'].to(Config.DEVICE))
+
+        avg_losses = {key: float(np.mean(values)) for key, values in epoch_losses.items() if values}
+        return avg_losses, meter.results()
+
     def train_epoch(self):
         """Train for one epoch"""
         self.model.train()
-        epoch_losses = {
-            'total_loss': [],
-            'viseme_loss': [],
-            'phoneme_loss': [],
-            'word_loss': [],
-            'fusion_reg': []
-        }
+        epoch_losses = {k: [] for k in self.LOSS_KEYS}
 
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.epoch + 1}")
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Move data to device
-            frames = batch['frames'].to(Config.DEVICE)
-            visemes = batch['visemes'].to(Config.DEVICE)
-            phonemes = batch['phonemes'].to(Config.DEVICE)
-            ambiguity_scores = batch['ambiguity_scores'].to(Config.DEVICE)
+            predictions, _, losses = self._run_batch(batch)
 
-            # Create speaker IDs (simple mapping s1=0, s2=1, s3=2)
-            speaker_ids = torch.tensor([
-                Config.SPEAKER_TO_ID.get(s, 0)
-                for s in batch['subjects']
-            ]).to(Config.DEVICE)
-
-            # Forward pass
-            predictions = self.model(
-                frames=frames,
-                phoneme_targets=phonemes,
-                speaker_ids=speaker_ids,
-                ambiguity_scores=ambiguity_scores
-            )
-
-            # Calculate loss
-            targets = {
-                'visemes': visemes,
-                'phonemes': phonemes
-            }
-
-            losses = self.model.compute_loss(predictions, targets)
-
-            # Backward pass
             self.optimizer.zero_grad()
             losses['total_loss'].backward()
-
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
             self.optimizer.step()
 
-            # Store losses
             for key, value in losses.items():
                 if key in epoch_losses:
                     epoch_losses[key].append(value.item())
 
-            # Update progress bar
             progress_bar.set_postfix({
                 'total_loss': f"{losses['total_loss'].item():.4f}",
                 'viseme_loss': f"{losses.get('viseme_loss', 0):.4f}",
@@ -175,107 +231,31 @@ class LipReadingTrainer:
                 for key, value in losses.items():
                     self.writer.add_scalar(f'Train/{key}', value.item(), global_step)
 
-                # Log fusion weights distribution
                 if predictions['fusion_weights'] is not None:
-                    # Stack the list of tensors into a single tensor
-                    if isinstance(predictions['fusion_weights'], list):
-                        fusion_weights = torch.stack(predictions['fusion_weights'],
-                                                     dim=-2)  # shape: [B, T, num_scales, 2]
-                    else:
-                        fusion_weights = predictions['fusion_weights']
-                    fusion_weights = fusion_weights.detach().cpu()
+                    fusion_weights = torch.stack(predictions['fusion_weights'], dim=-2).detach().cpu()
+                    self.writer.add_scalar('Train/avg_visual_weight', fusion_weights[..., 0].mean(), global_step)
+                    self.writer.add_scalar('Train/avg_language_weight', fusion_weights[..., 1].mean(), global_step)
 
-                    # Log average weights per modality
-                    visual_weights = fusion_weights[..., 0].mean()
-                    language_weights = fusion_weights[..., 1].mean()
-                    self.writer.add_scalar('Train/avg_visual_weight', visual_weights, global_step)
-                    self.writer.add_scalar('Train/avg_language_weight', language_weights, global_step)
-
-        # Calculate average losses for the epoch
-        avg_losses = {key: np.mean(values) for key, values in epoch_losses.items() if values}
+        avg_losses = {key: float(np.mean(values)) for key, values in epoch_losses.items() if values}
         self.train_losses.append(avg_losses['total_loss'])
-
         return avg_losses
 
     def validate_epoch(self):
         """Validate for one epoch"""
-        self.model.eval()
-        epoch_losses = {
-            'total_loss': [],
-            'viseme_loss': [],
-            'phoneme_loss': [],
-            'word_loss': []
-        }
-
-        # Metrics tracking
-        correct_visemes = 0
-        correct_phonemes = 0
-        total_predictions = 0
-
-        with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validation"):
-                # Move data to device
-                frames = batch['frames'].to(Config.DEVICE)
-                visemes = batch['visemes'].to(Config.DEVICE)
-                phonemes = batch['phonemes'].to(Config.DEVICE)
-                ambiguity_scores = batch['ambiguity_scores'].to(Config.DEVICE)
-
-                speaker_ids = torch.tensor([
-                    Config.SPEAKER_TO_ID.get(s, 0)
-                    for s in batch['subjects']
-                ]).to(Config.DEVICE)
-
-                # Forward pass
-                predictions = self.model(
-                    frames=frames,
-                    phoneme_targets=phonemes,
-                    speaker_ids=speaker_ids,
-                    ambiguity_scores=ambiguity_scores
-                )
-
-                # Calculate loss
-                targets = {
-                    'visemes': visemes,
-                    'phonemes': phonemes
-                }
-
-                losses = self.model.compute_loss(predictions, targets)
-
-                # Store losses
-                for key, value in losses.items():
-                    if key in epoch_losses:
-                        epoch_losses[key].append(value.item())
-
-                # Calculate accuracy
-                viseme_preds = torch.argmax(predictions['viseme_logits'], dim=-1)
-                phoneme_preds = torch.argmax(predictions['phoneme_logits'], dim=-1)
-
-                # Mask out padding tokens (-1)
-                valid_mask = (visemes != -1) & (phonemes != -1)
-
-                correct_visemes += (viseme_preds == visemes)[valid_mask].sum().item()
-                correct_phonemes += (phoneme_preds == phonemes)[valid_mask].sum().item()
-                total_predictions += valid_mask.sum().item()
-
-        # Calculate average losses and accuracies
-        avg_losses = {key: np.mean(values) for key, values in epoch_losses.items() if values}
-
-        viseme_accuracy = correct_visemes / total_predictions if total_predictions > 0 else 0
-        phoneme_accuracy = correct_phonemes / total_predictions if total_predictions > 0 else 0
-
+        avg_losses, metrics = self._evaluate_loader(self.val_loader, "Validation")
         self.val_losses.append(avg_losses['total_loss'])
 
-        # Log to tensorboard
         for key, value in avg_losses.items():
             self.writer.add_scalar(f'Val/{key}', value, self.epoch)
-
-        self.writer.add_scalar('Val/viseme_accuracy', viseme_accuracy, self.epoch)
-        self.writer.add_scalar('Val/phoneme_accuracy', phoneme_accuracy, self.epoch)
+        for key in ('viseme_accuracy', 'phoneme_accuracy', 'speech_viseme_accuracy', 'speech_phoneme_accuracy'):
+            self.writer.add_scalar(f'Val/{key}', metrics[key], self.epoch)
 
         logger.info(f"Validation - Loss: {avg_losses['total_loss']:.4f}, "
-                    f"Viseme Acc: {viseme_accuracy:.4f}, Phoneme Acc: {phoneme_accuracy:.4f}")
+                    f"Viseme Acc: {metrics['viseme_accuracy']:.4f}, Phoneme Acc: {metrics['phoneme_accuracy']:.4f} | "
+                    f"speech-only Viseme Acc: {metrics['speech_viseme_accuracy']:.4f}, "
+                    f"Phoneme Acc: {metrics['speech_phoneme_accuracy']:.4f}")
 
-        return avg_losses, viseme_accuracy, phoneme_accuracy
+        return avg_losses, metrics
 
     def _write_metrics_row(self, row):
         """Append one epoch's metrics to training_metrics.csv (header written on first row)."""
@@ -299,32 +279,22 @@ class LipReadingTrainer:
             self.epoch = epoch
             epoch_start = time.time()
 
-            # Training phase
             train_losses = self.train_epoch()
             logger.info(f"Epoch {epoch + 1} - Training Loss: {train_losses['total_loss']:.4f}, "
                         f"Viseme Loss: {train_losses.get('viseme_loss', float('nan')):.4f}, "
                         f"Phoneme Loss: {train_losses.get('phoneme_loss', float('nan')):.4f}")
 
-            # Validation phase
-            val_losses, viseme_acc, phoneme_acc = self.validate_epoch()
+            val_losses, val_metrics = self.validate_epoch()
 
-            # Learning rate scheduling
             self.scheduler.step(val_losses['total_loss'])
 
-            self._write_metrics_row({
-                'epoch': epoch + 1,
-                'lr': self.optimizer.param_groups[0]['lr'],
-                'epoch_seconds': round(time.time() - epoch_start, 1),
-                'train_total_loss': train_losses.get('total_loss'),
-                'train_viseme_loss': train_losses.get('viseme_loss'),
-                'train_phoneme_loss': train_losses.get('phoneme_loss'),
-                'train_fusion_reg': train_losses.get('fusion_reg'),
-                'val_total_loss': val_losses.get('total_loss'),
-                'val_viseme_loss': val_losses.get('viseme_loss'),
-                'val_phoneme_loss': val_losses.get('phoneme_loss'),
-                'val_viseme_accuracy': viseme_acc,
-                'val_phoneme_accuracy': phoneme_acc,
-            })
+            row = {'epoch': epoch + 1, 'lr': self.optimizer.param_groups[0]['lr'],
+                   'epoch_seconds': round(time.time() - epoch_start, 1)}
+            row.update({f'train_{k}': v for k, v in train_losses.items()})
+            row.update({f'val_{k}': v for k, v in val_losses.items()})
+            row.update({f'val_{k}': val_metrics[k] for k in ('viseme_accuracy', 'phoneme_accuracy',
+                                                             'speech_viseme_accuracy', 'speech_phoneme_accuracy')})
+            self._write_metrics_row(row)
 
             # Save best model
             if val_losses['total_loss'] < self.best_val_loss:
@@ -339,7 +309,6 @@ class LipReadingTrainer:
             # Always keep the latest state so an interrupted (e.g. Colab) session can resume
             self.save_checkpoint('last_model.pth')
 
-            # Early stopping
             self.early_stopping(val_losses['total_loss'])
             if self.early_stopping.early_stop:
                 logger.info(f"Early stopping triggered at epoch {epoch + 1}")
@@ -347,8 +316,14 @@ class LipReadingTrainer:
 
         logger.info("Training completed!")
 
-        # Final evaluation
         if self.test_loader is not None:
+            # Test the best (lowest validation loss) model, not whatever the last epoch produced
+            best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
+            if os.path.exists(best_path):
+                best = torch.load(best_path, map_location=Config.DEVICE, weights_only=False)
+                self.model.load_state_dict(best['model_state_dict'])
+                self.epoch = best['epoch']
+                logger.info(f"Loaded best model (epoch {self.epoch + 1}) for test evaluation")
             self.evaluate()
 
         self.writer.close()
@@ -357,106 +332,24 @@ class LipReadingTrainer:
         """Evaluate model on test set"""
         logger.info("Evaluating on test set...")
 
-        self.model.eval()
-        test_losses = {
-            'total_loss': [],
-            'viseme_loss': [],
-            'phoneme_loss': []
-        }
+        avg_losses, metrics = self._evaluate_loader(self.test_loader, "Testing")
 
-        correct_visemes = 0
-        correct_phonemes = 0
-        total_predictions = 0
-
-        # Per-ambiguity analysis
-        high_ambiguity_correct = 0
-        high_ambiguity_total = 0
-        low_ambiguity_correct = 0
-        low_ambiguity_total = 0
-
-        with torch.no_grad():
-            for batch in tqdm(self.test_loader, desc="Testing"):
-                frames = batch['frames'].to(Config.DEVICE)
-                visemes = batch['visemes'].to(Config.DEVICE)
-                phonemes = batch['phonemes'].to(Config.DEVICE)
-                ambiguity_scores = batch['ambiguity_scores'].to(Config.DEVICE)
-
-                speaker_ids = torch.tensor([
-                    Config.SPEAKER_TO_ID.get(s, 0)
-                    for s in batch['subjects']
-                ]).to(Config.DEVICE)
-
-                predictions = self.model(
-                    frames=frames,
-                    phoneme_targets=phonemes,
-                    speaker_ids=speaker_ids,
-                    ambiguity_scores=ambiguity_scores
-                )
-
-                targets = {
-                    'visemes': visemes,
-                    'phonemes': phonemes
-                }
-
-                losses = self.model.compute_loss(predictions, targets)
-
-                for key, value in losses.items():
-                    if key in test_losses:
-                        test_losses[key].append(value.item())
-
-                # Calculate accuracy
-                viseme_preds = torch.argmax(predictions['viseme_logits'], dim=-1)
-                phoneme_preds = torch.argmax(predictions['phoneme_logits'], dim=-1)
-
-                valid_mask = (visemes != -1) & (phonemes != -1)
-
-                correct_visemes += (viseme_preds == visemes)[valid_mask].sum().item()
-                correct_phonemes += (phoneme_preds == phonemes)[valid_mask].sum().item()
-                total_predictions += valid_mask.sum().item()
-
-                # Ambiguity-based analysis
-                high_ambiguity_mask = (ambiguity_scores > Config.AMBIGUITY_THRESHOLD) & valid_mask
-                low_ambiguity_mask = (ambiguity_scores <= Config.AMBIGUITY_THRESHOLD) & valid_mask
-
-                high_ambiguity_correct += (phoneme_preds == phonemes)[high_ambiguity_mask].sum().item()
-                high_ambiguity_total += high_ambiguity_mask.sum().item()
-
-                low_ambiguity_correct += (phoneme_preds == phonemes)[low_ambiguity_mask].sum().item()
-                low_ambiguity_total += low_ambiguity_mask.sum().item()
-
-        # Calculate metrics
-        avg_test_losses = {key: np.mean(values) for key, values in test_losses.items() if values}
-
-        viseme_accuracy = correct_visemes / total_predictions
-        phoneme_accuracy = correct_phonemes / total_predictions
-
-        high_amb_accuracy = high_ambiguity_correct / high_ambiguity_total if high_ambiguity_total > 0 else 0
-        low_amb_accuracy = low_ambiguity_correct / low_ambiguity_total if low_ambiguity_total > 0 else 0
-
-        # Log results
         logger.info("=" * 50)
         logger.info("TEST RESULTS")
         logger.info("=" * 50)
-        logger.info(f"Test Loss: {avg_test_losses['total_loss']:.4f}")
-        logger.info(f"Viseme Accuracy: {viseme_accuracy:.4f}")
-        logger.info(f"Phoneme Accuracy: {phoneme_accuracy:.4f}")
-        logger.info(f"High Ambiguity Phoneme Accuracy: {high_amb_accuracy:.4f}")
-        logger.info(f"Low Ambiguity Phoneme Accuracy: {low_amb_accuracy:.4f}")
+        logger.info(f"Test Loss: {avg_losses['total_loss']:.4f}")
+        logger.info(f"Viseme Accuracy: {metrics['viseme_accuracy']:.4f}")
+        logger.info(f"Phoneme Accuracy: {metrics['phoneme_accuracy']:.4f}")
+        logger.info(f"Speech-only Viseme Accuracy: {metrics['speech_viseme_accuracy']:.4f}")
+        logger.info(f"Speech-only Phoneme Accuracy: {metrics['speech_phoneme_accuracy']:.4f}")
+        logger.info(f"High Ambiguity Phoneme Accuracy: {metrics['high_ambiguity_accuracy']:.4f}")
+        logger.info(f"Low Ambiguity Phoneme Accuracy: {metrics['low_ambiguity_accuracy']:.4f}")
         logger.info("=" * 50)
 
-        test_results = {
-            'test_loss': avg_test_losses['total_loss'],
-            'viseme_accuracy': viseme_accuracy,
-            'phoneme_accuracy': phoneme_accuracy,
-            'high_ambiguity_accuracy': high_amb_accuracy,
-            'low_ambiguity_accuracy': low_amb_accuracy,
-            'total_frames': total_predictions,
-            'epoch': self.epoch + 1,
-        }
-
+        test_results = {'test_loss': avg_losses['total_loss'], **metrics,
+                        'epoch': self.epoch + 1, 'model_type': self.model.model_type}
         with open(self.test_results_path, 'w') as f:
-            json.dump({k: float(v) if isinstance(v, (np.floating, float)) else v
-                       for k, v in test_results.items()}, f, indent=2)
+            json.dump(test_results, f, indent=2)
         logger.info(f"Test results written to {self.test_results_path}")
 
         return test_results
@@ -474,6 +367,8 @@ class LipReadingTrainer:
 
         checkpoint = {
             'epoch': self.epoch,
+            'model_type': self.model.model_type,
+            'known_speakers': self.model.known_speakers,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -488,14 +383,15 @@ class LipReadingTrainer:
     def load_checkpoint(self, filepath):
         """Load model checkpoint (to resume training)"""
         # weights_only=False: our own checkpoints also hold optimizer/scheduler state and
-        # numpy scalars, which the PyTorch>=2.6 weights_only default rejects.
+        # Python scalars/lists, which the PyTorch>=2.6 weights_only default rejects.
         checkpoint = torch.load(filepath, map_location=Config.DEVICE, weights_only=False)
 
-        # The visual encoder builds fc1_dynamic/fc2_dynamic lazily on the first forward pass,
-        # so a freshly constructed model doesn't have them yet — create them before loading.
-        materialize_lazy_layers(self.model, checkpoint['model_state_dict'])
+        saved_type = checkpoint.get('model_type')
+        if saved_type and saved_type != self.model.model_type:
+            raise ValueError(f"Checkpoint was trained as '{saved_type}' but the model is "
+                             f"'{self.model.model_type}'; pass --model-type {saved_type} to resume.")
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.load_state_dict(upgrade_legacy_state_dict(checkpoint['model_state_dict']))
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
@@ -510,24 +406,18 @@ class LipReadingTrainer:
 
 def main():
     """Main training function"""
-    # Create data loaders
     train_loader, val_loader, test_loader = create_data_loaders(
         train_subjects=['s1'],
         val_subjects=['s2'],
         test_subjects=['s3']
     )
 
-    # Create model
-    model = VisemePhonemeAdaptiveModel()
-
-    # Create trainer
+    model = ModelFactory.create_full_model()
     trainer = LipReadingTrainer(model, train_loader, val_loader, test_loader)
 
-    # Print viseme mappings for reference
     logger.info("Viseme mappings:")
     viseme_mapper.print_mappings()
 
-    # Start training
     trainer.train()
 
 

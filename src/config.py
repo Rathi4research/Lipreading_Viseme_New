@@ -85,6 +85,14 @@ class Config:
     GRID_SPEAKERS = [f's{i}' for i in range(1, 35) if i != 21]
     SPEAKER_TO_ID = {speaker: idx for idx, speaker in enumerate(GRID_SPEAKERS)}
     NUM_SPEAKERS = len(GRID_SPEAKERS)
+    # Extra speaker-embedding slot for speakers not seen in training (speaker-independent eval)
+    UNKNOWN_SPEAKER_ID = NUM_SPEAKERS
+    # Probability of replacing a training sample's speaker with UNKNOWN_SPEAKER_ID (trains that slot)
+    SPEAKER_DROPOUT = 0.2
+
+    # Weight of the auxiliary viseme loss on the sequence model's own viseme head (that head's
+    # predictions drive the ambiguity scores and the language model input)
+    AUX_VISEME_LOSS_WEIGHT = 0.5
 
     # Device
     DEVICE = detect_device()

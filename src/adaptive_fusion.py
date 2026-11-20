@@ -105,64 +105,66 @@ class AdaptiveFusionModule(nn.Module):
 class ConfusionMatrixDecoder(nn.Module):
     """Decoder that uses confusion matrix for phoneme disambiguation"""
 
+    # Probability floor for phonemes outside a viseme's class. Keeps the prior's log finite (so
+    # the learnable adjustment can still move mass there) while leaving ~95%+ of each row's mass
+    # on the viseme's own phonemes at initialisation.
+    PRIOR_FLOOR = 1e-3
+
     def __init__(self, num_visemes=12, num_phonemes=len(Config.PHONEMES)):
         super(ConfusionMatrixDecoder, self).__init__()
 
+        # Prior P(phoneme | viseme), columns in Config.PHONEMES order (= phoneme target indices)
+        confusion_matrix, phoneme_to_idx = viseme_mapper.confusion_matrix
+        assert confusion_matrix.shape == (num_visemes, num_phonemes), \
+            f"confusion prior {confusion_matrix.shape} != ({num_visemes}, {num_phonemes})"
         self.num_visemes = num_visemes
         self.num_phonemes = num_phonemes
-
-        # Get confusion matrix from viseme mapper
-        confusion_matrix, phoneme_to_idx = viseme_mapper.confusion_matrix
         self.register_buffer('confusion_matrix', torch.FloatTensor(confusion_matrix))
         self.phoneme_to_idx = phoneme_to_idx
 
-        # Learnable parameters to adjust confusion matrix
+        # Learnable adjustment, applied in log space: softmax(log prior + adjustment).
+        # (Previously softmax was applied directly to the 0..1 probabilities, which flattened the
+        # prior to almost uniform — e.g. viseme 2's 12 phonemes kept ~24% of the mass vs 22% uniform.)
         self.confusion_adjustment = nn.Parameter(torch.zeros_like(self.confusion_matrix))
 
-        # Language model for phoneme sequences
-        num_phonemes = self.confusion_matrix.size(1)
+        # Sequence model over the phoneme distribution
         self.phoneme_lstm = nn.LSTM(
             input_size=num_phonemes,
-            hidden_size=Config.HIDDEN_DIM ,
+            hidden_size=Config.HIDDEN_DIM,
             num_layers=1,
             batch_first=True,
             bidirectional=True
         )
 
-
-        # Final prediction layer
+        # Final prediction layer: a learned correction on top of the prior (see forward).
+        # Zero-initialised so that at the start of training the output is exactly the prior.
         self.phoneme_predictor = nn.Linear(Config.HIDDEN_DIM * 2, num_phonemes)
+        nn.init.zeros_(self.phoneme_predictor.weight)
+        nn.init.zeros_(self.phoneme_predictor.bias)
 
-    def forward(self, viseme_probs):
+    def forward(self, viseme_logits):
         """
         Args:
-            viseme_probs: Viseme probabilities (batch_size, seq_len, num_visemes)
+            viseme_logits: Viseme logits (batch_size, seq_len, num_visemes)
         Returns:
-            phoneme_probs: Phoneme probabilities (batch_size, seq_len, num_phonemes)
+            phoneme_logits: (batch_size, seq_len, num_phonemes)
         """
-        batch_size, seq_len, _ = viseme_probs.shape
+        viseme_probs = F.softmax(viseme_logits, dim=-1)
 
-        # Apply softmax to viseme probabilities
-        viseme_probs = F.softmax(viseme_probs, dim=-1)
-
-        # Adjust confusion matrix with learnable parameters
-        adjusted_confusion = self.confusion_matrix + self.confusion_adjustment
-        adjusted_confusion = F.softmax(adjusted_confusion, dim=-1)
-
-        # Convert viseme probabilities to phoneme probabilities
+        # Viseme probabilities -> phoneme probabilities via the (adjusted) prior
         # viseme_probs: (B, T, V), confusion: (V, P) -> (B, T, P)
-        phoneme_probs = torch.matmul(viseme_probs, adjusted_confusion)
+        phoneme_probs = torch.matmul(viseme_probs, self.get_confusion_matrix())
 
-        # Apply language model for sequence modeling
+        # Sequence context to disambiguate phonemes within a viseme class, as a residual
+        # correction to the prior's log-probabilities (so the prior is actually used for the
+        # prediction rather than only shaping the LSTM input).
         lstm_out, _ = self.phoneme_lstm(phoneme_probs)
-        refined_phoneme_probs = self.phoneme_predictor(lstm_out)
-
-        return refined_phoneme_probs
+        return torch.log(phoneme_probs + 1e-8) + self.phoneme_predictor(lstm_out)
 
     def get_confusion_matrix(self):
-        """Get the current confusion matrix (including adjustments)"""
-        adjusted_confusion = self.confusion_matrix + self.confusion_adjustment
-        return F.softmax(adjusted_confusion, dim=-1)
+        """Current P(phoneme | viseme) including the learned adjustment, rows sum to 1"""
+        log_prior = torch.log(self.confusion_matrix.clamp_min(self.PRIOR_FLOOR))
+        return F.softmax(log_prior + self.confusion_adjustment, dim=-1)
 
 
 class MultiScaleAdaptiveFusion(nn.Module):
@@ -228,12 +230,7 @@ class MultiScaleAdaptiveFusion(nn.Module):
             scale_outputs.append(output)
             scale_weights_list.append(weights)
 
-        # Concatenate all scale outputs along feature dimension for attention
-        concatenated_for_attention = torch.cat(scale_outputs, dim=-1)  # (B, T, num_visemes * num_scales)
-
-        # Compute scale attention weights
-        scale_attention_weights = self.scale_attention(concatenated_for_attention)  # (B, T, num_scales)
-
+        # Scale attention over the concatenated per-scale outputs
         concat_scales = torch.cat(scale_outputs, dim=-1)  # (B, T, num_visemes * num_scales)
         scale_attention_weights = self.scale_attention(concat_scales)  # (B, T, num_scales)
         scale_attention_weights = scale_attention_weights.unsqueeze(-1)  # (B, T, num_scales, 1)
@@ -241,9 +238,7 @@ class MultiScaleAdaptiveFusion(nn.Module):
         final_output = torch.zeros_like(scale_outputs[0])
         for i, output in enumerate(scale_outputs):
             weight = scale_attention_weights[:, :, i]  # (B, T, 1)
-            final_output += output * weight
-
-
+            final_output = final_output + output * weight
 
         return final_output, {
             'scale_outputs': scale_outputs,

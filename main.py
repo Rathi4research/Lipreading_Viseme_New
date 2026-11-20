@@ -7,6 +7,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from src.config import Config, detect_device
 import logging
+import numpy as np
 import torch
 
 import sys
@@ -15,21 +16,18 @@ from src.data_loader import create_data_loaders
 from src.trainer import LipReadingTrainer
 from src.evaluator import LipReadingEvaluator
 from src.viseme_mapping import viseme_mapper
-from src.adaptive_fusion import MultiScaleAdaptiveFusion, ConfusionMatrixDecoder
+from models.fusion_network import ModelFactory
 
-from src.language_model import ContextualLanguageModel
-
-
-from models.fusion_network import VisemePhonemeAdaptiveModel, ModelFactory
-
-# Set up logging
+# Set up logging. force=True: imported modules (e.g. src.trainer) may already have configured the
+# root logger, which would otherwise make this a silent no-op and leave lipreading.log empty.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('lipreading.log'),
         logging.StreamHandler(sys.stdout)
-    ]
+    ],
+    force=True
 )
 logger = logging.getLogger(__name__)
 
@@ -60,6 +58,16 @@ def print_model_info(model):
         params = sum(p.numel() for p in module.parameters())
         logger.info(f"  {name}: {params:,} parameters")
     logger.info("=" * 60)
+
+
+def collapse_phonemes(indices):
+    """Per-frame phoneme ids -> readable phoneme string (merge repeats, drop silence)"""
+    out = []
+    for idx in indices:
+        p = Config.PHONEMES[idx] if 0 <= idx < len(Config.PHONEMES) else '?'
+        if not out or out[-1] != p:
+            out.append(p)
+    return ' '.join(p for p in out if p != 'sil')
 
 
 def resolve_checkpoint_dir(args):
@@ -96,13 +104,8 @@ def train_model(args):
         max_samples_per_subject=args.max_samples_per_subject
     )
 
-    # Create model
-    if args.model_type == 'baseline':
-        model = ModelFactory.create_baseline_model()
-    elif args.model_type == 'visual_only':
-        model = ModelFactory.create_visual_only_model()
-    else:
-        model = ModelFactory.create_full_model()
+    # Create model (same model_type is used for training and, via the checkpoint, evaluation)
+    model = ModelFactory.create(args.model_type or 'full')
 
     print_model_info(model)
 
@@ -149,8 +152,9 @@ def evaluate_model(args):
 
     # Generate plots
     if 'confusion_matrices' in results:
-        # Plot viseme confusion matrix
-        viseme_labels = [f"V{i}" for i in range(viseme_mapper.num_visemes)]
+        # Plot viseme confusion matrix (labels show the phonemes in each viseme class)
+        viseme_labels = [f"V{i} " + "/".join(p for p in viseme_mapper.viseme_to_phonemes[i] if p in Config.PHONEMES)[:12]
+                         for i in range(viseme_mapper.num_visemes)]
         evaluator.plot_confusion_matrix(
             results['confusion_matrices']['viseme_confusion_matrix'],
             viseme_labels,
@@ -158,14 +162,15 @@ def evaluate_model(args):
             "plots/viseme_confusion_matrix.png"
         )
 
-        # Plot phoneme confusion matrix (sample of phonemes)
-        phoneme_labels = [f"P{i}" for i in range(min(20, len(Config.PHONEMES)))]  # First 20 phonemes
-        cm_subset = results['confusion_matrices']['phoneme_confusion_matrix'][:20, :20]
+        # Plot phoneme confusion matrix restricted to phonemes that occur in the test set
+        phoneme_cm = results['confusion_matrices']['phoneme_confusion_matrix']
+        present = [i for i in range(phoneme_cm.shape[0]) if phoneme_cm[i].sum() > 0]
         evaluator.plot_confusion_matrix(
-            cm_subset,
-            phoneme_labels,
-            "Phoneme Confusion Matrix (First 20 Phonemes)",
-            "plots/phoneme_confusion_matrix.png"
+            phoneme_cm[np.ix_(present, present)],
+            [Config.PHONEMES[i] for i in present],
+            "Phoneme Confusion Matrix (phonemes present in test set)",
+            "plots/phoneme_confusion_matrix.png",
+            figsize=(max(12, len(present) * 0.45), max(10, len(present) * 0.4))
         )
 
 
@@ -184,100 +189,62 @@ def evaluate_model(args):
 
 
 def inference_demo(args):
-    """Run inference demo"""
+    """Run inference demo: per-utterance predictions vs targets for a few test samples"""
     logger.info("Running inference demo...")
 
-    # Load model
-    if args.checkpoint_path:
-        model = ModelFactory.load_pretrained_model(args.checkpoint_path, args.model_type)
-        logger.info(f"Loaded model from {args.checkpoint_path}")
-    else:
+    if not args.checkpoint_path:
         logger.error("No checkpoint path provided for inference")
         return
+    model = ModelFactory.load_pretrained_model(args.checkpoint_path, args.model_type)
+    logger.info(f"Loaded '{model.model_type}' model from {args.checkpoint_path}")
 
-    # Create a small demo dataset
     _, _, test_loader = create_data_loaders(test_subjects=args.test_subjects,
                                             max_samples_per_subject=args.max_samples_per_subject)
 
     model = model.to(Config.DEVICE)
     model.eval()
+    shown = 0
     with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
-            if batch_idx >= args.demo_samples:
+        for batch in test_loader:
+            if shown >= args.demo_samples:
                 break
 
             frames = batch['frames'].to(Config.DEVICE)
-            visemes = batch['visemes'].to(Config.DEVICE)
-            phonemes = batch['phonemes'].to(Config.DEVICE)
-            subjects = batch['subjects']
-            utterance_ids = batch['utterance_ids']
+            visemes = batch['visemes']
+            phonemes = batch['phonemes']
+            speaker_ids = model.speaker_ids_for(batch['subjects'], Config.DEVICE)
 
-            # Run inference
-            predictions = model.predict(frames)
+            predictions = model.predict(frames, speaker_ids=speaker_ids)
+            fusion_weights = predictions['fusion_weights']
+            if fusion_weights is not None:
+                fusion_weights = torch.stack(fusion_weights, dim=0).mean(dim=0)  # avg over scales -> (B, T, 2)
 
-            # Process results for each sample in batch
-            batch_size = frames.size(0)
-            for i in range(min(batch_size, args.demo_samples - batch_idx)):
+            for i in range(frames.size(0)):
+                if shown >= args.demo_samples:
+                    break
+                shown += 1
+
+                valid = phonemes[i] != -1
+                v_pred = predictions['viseme_predictions'][i].cpu()[valid].tolist()
+                p_pred = predictions['phoneme_predictions'][i].cpu()[valid].tolist()
+                v_true = visemes[i][valid].tolist()
+                p_true = phonemes[i][valid].tolist()
+                ambiguity = predictions['ambiguity_scores'][i].cpu()[valid].tolist()
+
                 logger.info(f"\n{'=' * 50}")
-                logger.info(f"DEMO SAMPLE {batch_idx * Config.BATCH_SIZE + i + 1}")
-                logger.info(f"Subject: {subjects[i]}, Utterance: {utterance_ids[i]}")
+                logger.info(f"DEMO SAMPLE {shown}: subject {batch['subjects'][i]}, utterance {batch['utterance_ids'][i]}")
+                logger.info(f"Words: {' '.join(batch['words'][i])}")
                 logger.info(f"{'=' * 50}")
+                logger.info(f"Frames: {len(v_true)}")
+                logger.info(f"Viseme Accuracy: {sum(p == t for p, t in zip(v_pred, v_true)) / len(v_true):.4f}")
+                logger.info(f"Phoneme Accuracy: {sum(p == t for p, t in zip(p_pred, p_true)) / len(p_true):.4f}")
+                logger.info(f"Average (predicted) Ambiguity: {sum(ambiguity) / len(ambiguity):.4f}")
+                logger.info(f"Predicted phonemes: {collapse_phonemes(p_pred)}")
+                logger.info(f"Target phonemes:    {collapse_phonemes(p_true)}")
 
-                # Get predictions for this sample
-                viseme_pred = predictions['viseme_predictions'][i]
-                phoneme_pred = predictions['phoneme_predictions'][i]
-                viseme_probs = predictions['viseme_probabilities'][i]
-                phoneme_probs = predictions['phoneme_probabilities'][i]
-                ambiguity = predictions['ambiguity_scores'][i]
-
-                # Remove padding and convert to lists
-                valid_length = (phonemes[i] != -1).sum().item()
-
-                viseme_pred_list = viseme_pred[:valid_length].cpu().tolist()
-                phoneme_pred_list = phoneme_pred[:valid_length].cpu().tolist()
-                viseme_target_list = visemes[i, :valid_length].cpu().tolist()
-                phoneme_target_list = phonemes[i, :valid_length].cpu().tolist()
-                ambiguity_list = ambiguity[:valid_length].cpu().tolist()
-
-                # Calculate accuracy
-                viseme_acc = sum(1 for p, t in zip(viseme_pred_list, viseme_target_list) if p == t) / len(
-                    viseme_pred_list)
-                phoneme_acc = sum(1 for p, t in zip(phoneme_pred_list, phoneme_target_list) if p == t) / len(
-                    phoneme_pred_list)
-
-                logger.info(f"Sequence Length: {valid_length}")
-                logger.info(f"Viseme Accuracy: {viseme_acc:.4f}")
-                logger.info(f"Phoneme Accuracy: {phoneme_acc:.4f}")
-                logger.info(f"Average Ambiguity: {sum(ambiguity_list) / len(ambiguity_list):.4f}")
-
-                # Show first 10 predictions vs targets
-                logger.info("\nFirst 10 Predictions vs Targets:")
-                logger.info("Pos | V_Pred V_True | P_Pred P_True | Ambiguity | Correct?")
-                logger.info("-" * 65)
-
-                for j in range(min(10, len(viseme_pred_list))):
-                    v_pred = viseme_pred_list[j]
-                    v_true = viseme_target_list[j]
-                    p_pred = phoneme_pred_list[j]
-                    p_true = phoneme_target_list[j]
-                    amb = ambiguity_list[j]
-
-                    v_correct = "✓" if v_pred == v_true else "✗"
-                    p_correct = "✓" if p_pred == p_true else "✗"
-
-                    logger.info(
-                        f"{j:2d}  |   {v_pred:2d}    {v_true:2d}   |   {p_pred:2d}    {p_true:2d}   |   {amb:.3f}   | {v_correct} {p_correct}")
-
-                # Show fusion weights if available
-                if predictions['fusion_weights'] is not None:
-                    fusion_weights = predictions['fusion_weights'][i, :valid_length]
-                    visual_weights = fusion_weights[:, 0].cpu().tolist()
-                    language_weights = fusion_weights[:, 1].cpu().tolist()
-
-                    avg_visual = sum(visual_weights) / len(visual_weights)
-                    avg_language = sum(language_weights) / len(language_weights)
-
-                    logger.info(f"\nFusion Weights - Visual: {avg_visual:.4f}, Language: {avg_language:.4f}")
+                if fusion_weights is not None:
+                    fw = fusion_weights[i].cpu()[valid]
+                    logger.info(f"Fusion Weights - Visual: {fw[:, 0].mean():.4f}, Language: {fw[:, 1].mean():.4f}")
 
     logger.info("Inference demo completed!")
 
@@ -319,8 +286,8 @@ def analyze_dataset(args):
     logger.info(f"Phoneme sequence shape: {phonemes.shape}")
     logger.info(f"Ambiguity scores shape: {ambiguity_scores.shape}")
 
-    # Ambiguity distribution
-    valid_ambiguity = ambiguity_scores[ambiguity_scores >= 0]  # Remove padding
+    # Ambiguity distribution (ground truth, over non-padding frames)
+    valid_ambiguity = ambiguity_scores[visemes != -1]
     logger.info(f"Ambiguity score range: {valid_ambiguity.min():.3f} - {valid_ambiguity.max():.3f}")
     logger.info(f"Average ambiguity: {valid_ambiguity.mean():.3f}")
 
@@ -339,54 +306,39 @@ def analyze_dataset(args):
     viseme_mapper.print_mappings()
 
 
-def create_sample_data():
-    """Create sample data files for testing"""
-    logger.info("Creating sample data files...")
+def create_sample_data(num_utterances=6, subjects=('s1', 's2', 's3')):
+    """Create a tiny synthetic dataset for smoke-testing the pipeline (not real data).
 
-    # Create directories
-    for subject in ['s1', 's2', 's3']:
-        os.makedirs(f'data/videos/{subject}', exist_ok=True)
-        os.makedirs(f'data/alignments/{subject}', exist_ok=True)
+    Writes GRID-format .align files (random grammatical GRID sentences, times in 1/25000 s) and
+    random-noise lip-crop .npy files under Config.DATA_DIR, so train/evaluate/inference can run
+    end to end without the real corpus. Accuracy numbers on this data are meaningless.
+    """
+    logger.info(f"Creating synthetic sample data under {Config.DATA_DIR} ...")
+    rng = np.random.default_rng(0)
+    slots = [Config.COMMANDS, Config.COLORS, Config.PREPOSITIONS, Config.LETTERS, Config.DIGITS, Config.ADVERBS]
 
-    # Create sample alignment files
-    sample_alignments = {
-        'bbaf2n': [
-            '0.0 0.2 sil',
-            '0.2 0.4 b',
-            '0.4 0.6 i',
-            '0.6 0.8 n',
-            '0.8 1.0 sil',
-            '1.0 1.2 b',
-            '1.2 1.4 l',
-            '1.4 1.6 u',
-            '1.6 1.8 sil'
-        ],
-        'bbaf3s': [
-            '0.0 0.15 sil',
-            '0.15 0.3 b',
-            '0.3 0.45 i',
-            '0.45 0.6 n',
-            '0.6 0.75 sil',
-            '0.75 0.9 r',
-            '0.9 1.05 e',
-            '1.05 1.2 d',
-            '1.2 1.35 sil'
-        ]
-    }
+    for subject in subjects:
+        align_dir = os.path.join(Config.ALIGNMENT_DIR, subject)
+        npy_dir = os.path.join(Config.PREPROCESSED_DIR, subject)
+        os.makedirs(align_dir, exist_ok=True)
+        os.makedirs(npy_dir, exist_ok=True)
 
-    for subject in ['s1', 's2', 's3']:
-        for utterance_id, alignment in sample_alignments.items():
-            align_path = f'data/alignments/{subject}/{utterance_id}.align'
-            with open(align_path, 'w') as f:
-                f.write('\n'.join(alignment))
+        for n in range(num_utterances):
+            words = [str(rng.choice(slot)) for slot in slots]
+            utterance_id = f"sample{n:02d}"
+            t, lines = 0, []
+            for label, dur in [('sil', 12000)] + [(w, 9000) for w in words]:
+                lines.append(f"{t} {t + dur} {label}")
+                t += dur
+            lines.append(f"{t} 74500 sil")
+            with open(os.path.join(align_dir, utterance_id + '.align'), 'w') as f:
+                f.write('\n'.join(lines) + '\n')
 
-            # Create dummy video file (just create empty file as placeholder)
-            video_path = f'data/videos/{subject}/{utterance_id}.mp4'
-            with open(video_path, 'w') as f:
-                f.write('')  # Placeholder - would need actual video data
+            num_frames = Config.SEQUENCE_LENGTH - (n % 2) * 3  # some clips slightly short
+            frames = rng.random((num_frames, Config.FRAME_HEIGHT, Config.FRAME_WIDTH), dtype=np.float32)
+            np.save(os.path.join(npy_dir, utterance_id + '.npy'), frames)
 
-    logger.info("Sample data files created!")
-    logger.info("Note: Video files are placeholders. Replace with actual .mp4 files.")
+    logger.info(f"Synthetic data created for {list(subjects)} ({num_utterances} utterances each).")
 
 
 def main():
@@ -399,7 +351,9 @@ def main():
 
     # Model configuration
     parser.add_argument('--model-type', choices=['full', 'baseline', 'visual_only'],
-                        default='full', help='Model type to use')
+                        default=None,
+                        help="Model variant for training (default: full). For evaluate/inference "
+                             "the type stored in the checkpoint is used.")
     parser.add_argument('--checkpoint-path', type=str, help='Path to model checkpoint')
     parser.add_argument('--resume-from', type=str, help='Resume training from checkpoint')
 
@@ -468,7 +422,7 @@ def main():
 
     logger.info(f"Using device: {Config.DEVICE}")
     logger.info(f"Mode: {args.mode}")
-    logger.info(f"Model type: {args.model_type}")
+    logger.info(f"Model type: {args.model_type or ('full' if args.mode == 'train' else 'from checkpoint')}")
     logger.info(f"Data dir: {Config.DATA_DIR} | Frame size: {Config.FRAME_HEIGHT}x{Config.FRAME_WIDTH}")
 
     # Execute based on mode
