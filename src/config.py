@@ -2,12 +2,35 @@ import os
 import torch
 
 
+def detect_device():
+    """Best available accelerator: CUDA (Colab/NVIDIA) > MPS (Apple Silicon) > CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class Config:
     # Data paths
     DATA_DIR = "data"
     VIDEO_DIR = os.path.join(DATA_DIR, "videos")
     ALIGNMENT_DIR = os.path.join(DATA_DIR, "alignments")
+    # Lip crops produced by scripts/preprocess.py: <PREPROCESSED_DIR>/<subject>/<utterance_id>.npy
+    PREPROCESSED_DIR = os.path.join(DATA_DIR, "preprocessed_lips")
+
+    # Checkpoints: CHECKPOINT_DIR is the persistent (Google Drive) default used on Colab;
+    # LOCAL_CHECKPOINT_DIR is used instead when main.py is run with --local-checkpoints.
     CHECKPOINT_DIR = "/content/drive/MyDrive/Lipreading_Checkpoints/"
+    LOCAL_CHECKPOINT_DIR = "checkpoints"
+
+    @classmethod
+    def set_data_dir(cls, data_dir):
+        """Re-point all data paths at a new root (paths are derived, so update them together)."""
+        cls.DATA_DIR = data_dir
+        cls.VIDEO_DIR = os.path.join(data_dir, "videos")
+        cls.ALIGNMENT_DIR = os.path.join(data_dir, "alignments")
+        cls.PREPROCESSED_DIR = os.path.join(data_dir, "preprocessed_lips")
 
     # Model parameters
     VISUAL_FEATURE_DIM = 512
@@ -27,6 +50,7 @@ class Config:
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 100
     PATIENCE = 10
+    NUM_WORKERS = 0  # DataLoader workers; 0 avoids Colab worker crashes
 
     # Adaptive fusion parameters
     FUSION_ALPHA = 0.5  # Balance between visual and language model
@@ -63,4 +87,4 @@ class Config:
     NUM_SPEAKERS = len(GRID_SPEAKERS)
 
     # Device
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = detect_device()

@@ -2,13 +2,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+import csv
+import json
 import os
+import time
 import numpy as np
 from tqdm import tqdm
 import logging
 from src.config import Config
 
 from models.fusion_network import VisemePhonemeAdaptiveModel
+from models.visual_encoder import materialize_lazy_layers
 from src.data_loader import create_data_loaders
 from src.viseme_mapping import viseme_mapper
 
@@ -40,11 +44,27 @@ class EarlyStopping:
 class LipReadingTrainer:
     """Training class for the viseme-phoneme adaptive model"""
 
-    def __init__(self, model, train_loader, val_loader, test_loader=None):
+    METRIC_FIELDS = [
+        'epoch', 'lr', 'epoch_seconds',
+        'train_total_loss', 'train_viseme_loss', 'train_phoneme_loss', 'train_fusion_reg',
+        'val_total_loss', 'val_viseme_loss', 'val_phoneme_loss',
+        'val_viseme_accuracy', 'val_phoneme_accuracy',
+    ]
+
+    def __init__(self, model, train_loader, val_loader, test_loader=None, checkpoint_dir=None):
         self.model = model.to(Config.DEVICE)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
+
+        # Where checkpoints, the per-epoch metrics CSV and the test results JSON are written.
+        # Defaults to Config.CHECKPOINT_DIR (Google Drive on Colab); main.py --local-checkpoints
+        # / --checkpoint-dir override it. Created up front so a bad path fails before training.
+        self.checkpoint_dir = checkpoint_dir or Config.CHECKPOINT_DIR
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.metrics_path = os.path.join(self.checkpoint_dir, 'training_metrics.csv')
+        self.test_results_path = os.path.join(self.checkpoint_dir, 'test_results.json')
+        self.resumed = False
 
         # Optimizer and scheduler
         self.optimizer = optim.Adam(
@@ -75,6 +95,7 @@ class LipReadingTrainer:
 
         logger.info(f"Trainer initialized. Model has {self._count_parameters()} parameters.")
         logger.info(f"Training on {len(train_loader)} batches, validating on {len(val_loader)} batches.")
+        logger.info(f"Checkpoints and metrics will be written to: {os.path.abspath(self.checkpoint_dir)}")
 
     def _get_timestamp(self):
         """Get current timestamp for logging"""
@@ -256,16 +277,33 @@ class LipReadingTrainer:
 
         return avg_losses, viseme_accuracy, phoneme_accuracy
 
+    def _write_metrics_row(self, row):
+        """Append one epoch's metrics to training_metrics.csv (header written on first row)."""
+        write_header = not os.path.exists(self.metrics_path)
+        with open(self.metrics_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.METRIC_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, '') for k in self.METRIC_FIELDS})
+
     def train(self, num_epochs=Config.NUM_EPOCHS):
         """Full training loop"""
-        logger.info(f"Starting training for {num_epochs} epochs")
+        # Fresh run: start a new metrics file. Resumed run: keep appending to the existing one.
+        start_epoch = self.epoch + 1 if self.resumed else 0
+        if not self.resumed and os.path.exists(self.metrics_path):
+            os.remove(self.metrics_path)
 
-        for epoch in range(num_epochs):
+        logger.info(f"Starting training for epochs {start_epoch + 1}..{num_epochs}")
+
+        for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
+            epoch_start = time.time()
 
             # Training phase
             train_losses = self.train_epoch()
-            logger.info(f"Epoch {epoch + 1} - Training Loss: {train_losses['total_loss']:.4f}")
+            logger.info(f"Epoch {epoch + 1} - Training Loss: {train_losses['total_loss']:.4f}, "
+                        f"Viseme Loss: {train_losses.get('viseme_loss', float('nan')):.4f}, "
+                        f"Phoneme Loss: {train_losses.get('phoneme_loss', float('nan')):.4f}")
 
             # Validation phase
             val_losses, viseme_acc, phoneme_acc = self.validate_epoch()
@@ -273,15 +311,33 @@ class LipReadingTrainer:
             # Learning rate scheduling
             self.scheduler.step(val_losses['total_loss'])
 
+            self._write_metrics_row({
+                'epoch': epoch + 1,
+                'lr': self.optimizer.param_groups[0]['lr'],
+                'epoch_seconds': round(time.time() - epoch_start, 1),
+                'train_total_loss': train_losses.get('total_loss'),
+                'train_viseme_loss': train_losses.get('viseme_loss'),
+                'train_phoneme_loss': train_losses.get('phoneme_loss'),
+                'train_fusion_reg': train_losses.get('fusion_reg'),
+                'val_total_loss': val_losses.get('total_loss'),
+                'val_viseme_loss': val_losses.get('viseme_loss'),
+                'val_phoneme_loss': val_losses.get('phoneme_loss'),
+                'val_viseme_accuracy': viseme_acc,
+                'val_phoneme_accuracy': phoneme_acc,
+            })
+
             # Save best model
             if val_losses['total_loss'] < self.best_val_loss:
                 self.best_val_loss = val_losses['total_loss']
-                self.save_checkpoint(f'best_model.pth', is_best=True)
+                self.save_checkpoint('best_model.pth')
                 logger.info(f"New best model saved with validation loss: {self.best_val_loss:.4f}")
 
             # Save regular checkpoint
             if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pth')
+
+            # Always keep the latest state so an interrupted (e.g. Colab) session can resume
+            self.save_checkpoint('last_model.pth')
 
             # Early stopping
             self.early_stopping(val_losses['total_loss'])
@@ -388,18 +444,33 @@ class LipReadingTrainer:
         logger.info(f"Low Ambiguity Phoneme Accuracy: {low_amb_accuracy:.4f}")
         logger.info("=" * 50)
 
-        return {
+        test_results = {
             'test_loss': avg_test_losses['total_loss'],
             'viseme_accuracy': viseme_accuracy,
             'phoneme_accuracy': phoneme_accuracy,
             'high_ambiguity_accuracy': high_amb_accuracy,
-            'low_ambiguity_accuracy': low_amb_accuracy
+            'low_ambiguity_accuracy': low_amb_accuracy,
+            'total_frames': total_predictions,
+            'epoch': self.epoch + 1,
         }
 
-    def save_checkpoint(self, filename, is_best=False):
-        """Save model checkpoint"""
-        os.makedirs('checkpoints', exist_ok=True)
-        filepath = os.path.join('checkpoints', filename)
+        with open(self.test_results_path, 'w') as f:
+            json.dump({k: float(v) if isinstance(v, (np.floating, float)) else v
+                       for k, v in test_results.items()}, f, indent=2)
+        logger.info(f"Test results written to {self.test_results_path}")
+
+        return test_results
+
+    @staticmethod
+    def _config_snapshot():
+        """Plain-data copy of Config (picklable; skips methods/classmethods)."""
+        simple = (str, int, float, bool, list, tuple, dict, type(None))
+        return {k: v for k, v in vars(Config).items()
+                if not k.startswith('__') and isinstance(v, simple)}
+
+    def save_checkpoint(self, filename):
+        """Save model checkpoint to self.checkpoint_dir"""
+        filepath = os.path.join(self.checkpoint_dir, filename)
 
         checkpoint = {
             'epoch': self.epoch,
@@ -409,19 +480,20 @@ class LipReadingTrainer:
             'best_val_loss': self.best_val_loss,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'config': {k: v for k, v in Config.__dict__.items() if not callable(v) and not k.startswith('__')}
-
+            'config': self._config_snapshot()
         }
 
         torch.save(checkpoint, filepath)
 
-        if is_best:
-            best_path = os.path.join('checkpoints', 'best_model.pth')
-            torch.save(checkpoint, best_path)
-
     def load_checkpoint(self, filepath):
-        """Load model checkpoint"""
-        checkpoint = torch.load(filepath, map_location=Config.DEVICE)
+        """Load model checkpoint (to resume training)"""
+        # weights_only=False: our own checkpoints also hold optimizer/scheduler state and
+        # numpy scalars, which the PyTorch>=2.6 weights_only default rejects.
+        checkpoint = torch.load(filepath, map_location=Config.DEVICE, weights_only=False)
+
+        # The visual encoder builds fc1_dynamic/fc2_dynamic lazily on the first forward pass,
+        # so a freshly constructed model doesn't have them yet — create them before loading.
+        materialize_lazy_layers(self.model, checkpoint['model_state_dict'])
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -431,8 +503,9 @@ class LipReadingTrainer:
         self.best_val_loss = checkpoint['best_val_loss']
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
+        self.resumed = True
 
-        logger.info(f"Checkpoint loaded from epoch {self.epoch}")
+        logger.info(f"Checkpoint loaded from epoch {self.epoch + 1}")
 
 
 def main():

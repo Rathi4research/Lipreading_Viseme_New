@@ -17,13 +17,22 @@ There is no packaging, linting, or automated test setup. Everything is run direc
 ```bash
 # Install dependencies
 pip install -r requirements.txt
-# dlib is also required (see dlib-19.24.1-cp311-cp311-win_amd64.whl for a Windows/py3.11 prebuilt wheel)
+# dlib is only needed for scripts/preprocess.py (and the slow on-the-fly fallback in the data loader)
+
+# Pre-extract lip crops once (parallel dlib) -> data/preprocessed_lips/<speaker>/<utt>.npy
+python scripts/preprocess.py --speakers s1 s2 s3 --size 80 [--backup-dir <drive folder>]
 
 # Train (mode is positional; subjects/model-type/etc. are flags)
-python main.py train --model-type full --train-subjects s1 --val-subjects s2 --test-subjects s3
+python main.py train --model-type full --frame-size 80 --train-subjects s1 --val-subjects s2 --test-subjects s3
+
+# Quick local run (e.g. Apple Silicon/MPS): checkpoints to ./checkpoints, few utterances per speaker
+python main.py train --local-checkpoints --frame-size 80 --max-samples-per-subject 50 --num-epochs 2
+
+# Resume an interrupted run (last_model.pth is written every epoch)
+python main.py train ... --resume-from <checkpoint-dir>/last_model.pth
 
 # Evaluate a checkpoint
-python main.py evaluate --checkpoint-path checkpoints/best_model.pth --model-type full
+python main.py evaluate --checkpoint-path <checkpoint-dir>/best_model.pth --model-type full
 
 # Run the inference demo (prints per-sample viseme/phoneme predictions)
 python main.py inference --checkpoint-path checkpoints/best_model.pth
@@ -41,20 +50,31 @@ python test.py <model_path> <video_path>
 `main_old.py` is a stale duplicate of `main.py` — prefer `main.py`. `src/trainer.py` also has its own
 `main()` for a minimal training run; `main.py train` is the primary entry point and supersedes it.
 
+Runtime flags on `main.py` (all modes): `--device auto|cuda|mps|cpu` (auto = cuda > mps > cpu),
+`--data-dir`, `--frame-size`, `--num-workers`, `--max-samples-per-subject`, `--batch-size`,
+`--learning-rate`. Checkpoint location for `train`: `Config.CHECKPOINT_DIR` (Google Drive on Colab) by
+default, `--local-checkpoints` for `./checkpoints`, or `--checkpoint-dir PATH`. The trainer writes
+`best_model.pth`, `last_model.pth` (every epoch), `checkpoint_epoch_N.pth` (every 5),
+`training_metrics.csv` (one row per epoch) and `test_results.json` into that directory.
+
+The Colab notebook (`LipReading_Viseme_resolved_code.ipynb`) is meant to be a thin orchestrator
+(GPU/Drive setup, data restore, invoking `scripts/preprocess.py` and `main.py`); code changes belong
+in the repo, not in notebook cells that patch source files.
+
 ## Data layout
 
 The `GRIDDataset` (`src/data_loader.py`) expects, per subject (e.g. `s1`, `s2`, `s3`):
 
 ```
-data/videos/<subject>/<utterance_id>.mp4|.mpg
-data/alignments/<subject>/<utterance_id>.align   # "start end label" lines, GRID-style forced alignments
+data/alignments/<subject>/<utterance_id>.align        # "start end word" lines, GRID forced alignments
+data/preprocessed_lips/<subject>/<utterance_id>.npy   # (T, H, W) float32 lip crops from scripts/preprocess.py
+data/videos/<subject>/<utterance_id>.mpg|.mp4         # optional: only used if the .npy is missing
 ```
 
-None of this data is checked into the repo — `python main.py create_sample` only creates placeholder
-`.align` files and empty video stubs for pipeline smoke-testing, not real videos.
-
-Dataset loading requires `shape_predictor_68_face_landmarks.dat` (dlib's 68-point facial landmark model,
-present at the repo root) to crop the mouth ROI from each frame via `dlib.get_frontal_face_detector()`.
+Samples are discovered from the `.npy` files and/or videos (an `.align` file is required). Frames are
+padded/truncated to `Config.SEQUENCE_LENGTH` and resized to `Config.FRAME_HEIGHT x FRAME_WIDTH`. If an
+utterance has no `.npy`, the raw video is cropped on the fly with dlib (slow; needs
+`shape_predictor_68_face_landmarks.dat` at the repo root). None of this data is checked into the repo.
 
 ## Architecture
 

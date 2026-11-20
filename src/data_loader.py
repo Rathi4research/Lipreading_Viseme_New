@@ -1,9 +1,8 @@
 import os
 import logging
 import torch
-import cv2
+import torch.nn.functional as F
 import numpy as np
-import dlib
 from torch.utils.data import Dataset, DataLoader
 from src.config import Config
 from src.viseme_mapping import viseme_mapper
@@ -53,63 +52,89 @@ GRID_WORD_TO_PHONEMES = {
 
 
 class GRIDDataset(Dataset):
-    def __init__(self, data_dir, subjects=['s1', 's2', 's3'], transform=None):
+    """GRID utterances as (frames, per-frame phoneme/viseme labels).
+
+    Frames come from the preprocessed lip crops in Config.PREPROCESSED_DIR
+    (<subject>/<utterance_id>.npy, produced by scripts/preprocess.py). If an utterance has no
+    .npy file, the raw video in Config.VIDEO_DIR is cropped on the fly with dlib instead (slow).
+    Samples are discovered from either source, so a local run only needs the .npy files and
+    the .align files — the raw videos are optional.
+    """
+
+    def __init__(self, data_dir, subjects=['s1', 's2', 's3'], transform=None, max_samples_per_subject=None):
         self.data_dir = data_dir
         self.subjects = subjects
         self.transform = transform
         self.samples = []
 
-        # dlib face detector + landmark predictor
-        self.detector = dlib.get_frontal_face_detector()
-        self.predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+        # dlib detector/predictor are only needed for the on-the-fly fallback; created lazily.
+        self._detector = None
+        self._predictor = None
+        self._warned_fallback = False
 
-        # Load all video-alignment pairs
         for subject in subjects:
             video_dir = os.path.join(Config.VIDEO_DIR, subject)
+            npy_dir = os.path.join(Config.PREPROCESSED_DIR, subject)
             align_dir = os.path.join(Config.ALIGNMENT_DIR, subject)
 
-            if os.path.exists(video_dir) and os.path.exists(align_dir):
-                video_files = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.mpg'))]
+            if not os.path.isdir(align_dir):
+                logger.warning(f"No alignment directory for subject {subject}: {align_dir}")
+                continue
 
-                for video_file in video_files:
-                    base_name = os.path.splitext(video_file)[0]
-                    align_file = base_name + '.align'
+            # utterance_id -> raw video path (if any)
+            videos = {}
+            if os.path.isdir(video_dir):
+                for f in os.listdir(video_dir):
+                    if f.endswith(('.mp4', '.mpg')):
+                        videos[os.path.splitext(f)[0]] = os.path.join(video_dir, f)
 
-                    video_path = os.path.join(video_dir, video_file)
-                    align_path = os.path.join(align_dir, align_file)
+            npys = set()
+            if os.path.isdir(npy_dir):
+                npys = {os.path.splitext(f)[0] for f in os.listdir(npy_dir) if f.endswith('.npy')}
 
-                    if os.path.exists(align_path):
-                        self.samples.append({
-                            'video_path': video_path,
-                            'align_path': align_path,
-                            'subject': subject,
-                            'utterance_id': base_name
-                        })
+            subject_samples = []
+            for utterance_id in sorted(set(videos) | npys):
+                align_path = os.path.join(align_dir, utterance_id + '.align')
+                if not os.path.exists(align_path):
+                    continue
+                subject_samples.append({
+                    'video_path': videos.get(utterance_id),
+                    'npy_path': os.path.join(npy_dir, utterance_id + '.npy') if utterance_id in npys else None,
+                    'align_path': align_path,
+                    'subject': subject,
+                    'utterance_id': utterance_id
+                })
+
+            if max_samples_per_subject is not None:
+                subject_samples = subject_samples[:max_samples_per_subject]
+            self.samples.extend(subject_samples)
 
         print(f"Loaded {len(self.samples)} samples from subjects {subjects}")
 
     def __len__(self):
         return len(self.samples)
 
+    def _load_frames(self, sample):
+        """Return frames as a float tensor of shape (T, 1, H, W)."""
+        if sample['npy_path'] is not None:
+            frames = np.load(sample['npy_path'])
+        elif sample['video_path'] is not None:
+            if not self._warned_fallback:
+                logger.warning("No preprocessed .npy for some samples (e.g. %s); cropping raw video "
+                               "with dlib on the fly, which is slow. Run scripts/preprocess.py first.",
+                               sample['utterance_id'])
+                self._warned_fallback = True
+            frames = self.load_video(sample['video_path'])
+        else:
+            raise FileNotFoundError(f"No .npy or video found for {sample['subject']}/{sample['utterance_id']}")
+
+        return torch.tensor(frames, dtype=torch.float32).unsqueeze(1)
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        video_path = sample.get('video_path', sample.get('video', ''))
-        align_path = sample.get('align_path', sample.get('align', ''))
+        align_path = sample['align_path']
 
-        # Map original video path to the preprocessed .npy path
-        npy_path = video_path.replace('data/videos', 'data/preprocessed_lips').replace('.mpg', '.npy').replace('.mp4', '.npy')
-
-        import numpy as np
-        import torch
-        import torch.nn.functional as F
-        from src.config import Config
-        from src.viseme_mapping import viseme_mapper
-
-        # Load the saved numpy array
-        frames = np.load(npy_path)
-
-        # Add the channel dimension so it becomes (T, 1, H, W)
-        video_tensor = torch.tensor(frames, dtype=torch.float32).unsqueeze(1)
+        video_tensor = self._load_frames(sample)
 
         # Pad or truncate sequence length to Config.SEQUENCE_LENGTH
         seq_len = video_tensor.shape[0]
@@ -148,12 +173,19 @@ class GRIDDataset(Dataset):
             'visemes': visemes_tensor,
             'ambiguity_scores': ambiguity_tensor,
             'words': words,
-            'subject': sample.get('subject', ''),
-            'utterance_id': sample.get('utterance_id', '')
+            'subject': sample['subject'],
+            'utterance_id': sample['utterance_id']
         }
 
     def load_video(self, video_path):
-        """Load video frames and crop mouth region"""
+        """Load video frames and crop mouth region (on-the-fly fallback; needs dlib + cv2)"""
+        import cv2
+        import dlib
+
+        if self._detector is None:
+            self._detector = dlib.get_frontal_face_detector()
+            self._predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
         cap = cv2.VideoCapture(video_path)
         frames = []
 
@@ -163,10 +195,10 @@ class GRIDDataset(Dataset):
                 break
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            dets = self.detector(gray, 1)
+            dets = self._detector(gray, 1)
 
             if len(dets) > 0:
-                shape = self.predictor(gray, dets[0])
+                shape = self._predictor(gray, dets[0])
                 mouth_points = shape.parts()[48:68]  # landmarks 48–67 are mouth
                 x_min = min([p.x for p in mouth_points])
                 y_min = min([p.y for p in mouth_points])
@@ -257,11 +289,9 @@ class GRIDDataset(Dataset):
 
 def collate_fn(batch):
     """Custom collate function for DataLoader"""
-    import torch
-    
     # Ensure all frames have the same sequence length by padding to max_len in batch
     max_len = max([item['frames'].shape[0] for item in batch])
-    
+
     processed_frames = []
     for item in batch:
         f = item['frames']
@@ -272,7 +302,7 @@ def collate_fn(batch):
         elif f.shape[0] > max_len:
             f = f[:max_len]
         processed_frames.append(f)
-        
+
     frames = torch.stack(processed_frames)
     phonemes = torch.stack([item['phonemes'] for item in batch])
     visemes = torch.stack([item['visemes'] for item in batch])
@@ -289,18 +319,21 @@ def collate_fn(batch):
     }
 
 
-def create_data_loaders(train_subjects=['s1'], val_subjects=['s2'], test_subjects=['s3']):
-    """Create train, validation, and test data loaders"""
+def create_data_loaders(train_subjects=['s1'], val_subjects=['s2'], test_subjects=['s3'],
+                        max_samples_per_subject=None):
+    """Create train, validation, and test data loaders.
 
-    train_dataset = GRIDDataset(Config.DATA_DIR, subjects=train_subjects)
-    val_dataset = GRIDDataset(Config.DATA_DIR, subjects=val_subjects)
-    test_dataset = GRIDDataset(Config.DATA_DIR, subjects=test_subjects)
+    max_samples_per_subject caps utterances per speaker (e.g. for a quick local run).
+    """
 
-    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE,
-                              shuffle=True, collate_fn=collate_fn, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE,
-                            shuffle=False, collate_fn=collate_fn, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE,
-                             shuffle=False, collate_fn=collate_fn, num_workers=0)
+    def make(subjects, shuffle):
+        dataset = GRIDDataset(Config.DATA_DIR, subjects=subjects,
+                              max_samples_per_subject=max_samples_per_subject)
+        return DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=shuffle,
+                          collate_fn=collate_fn, num_workers=Config.NUM_WORKERS)
+
+    train_loader = make(train_subjects, shuffle=True)
+    val_loader = make(val_subjects, shuffle=False)
+    test_loader = make(test_subjects, shuffle=False)
 
     return train_loader, val_loader, test_loader

@@ -5,11 +5,16 @@ from src.config import Config
 
 
 class VisualEncoder(nn.Module):
-    def __init__(self, input_dim=(Config.FRAME_HEIGHT, Config.FRAME_WIDTH),
-                 output_dim=Config.VISUAL_FEATURE_DIM,
+    def __init__(self, input_dim=None,
+                 output_dim=None,
                  input_channels=1,
                  dummy_seq_len=None):
         super(VisualEncoder, self).__init__()
+
+        # Read Config at construction time (not import time) so runtime overrides such as
+        # main.py --frame-size take effect.
+        input_dim = input_dim or (Config.FRAME_HEIGHT, Config.FRAME_WIDTH)
+        output_dim = output_dim or Config.VISUAL_FEATURE_DIM
 
         self.input_channels = input_channels
         self.input_dim = input_dim
@@ -78,9 +83,7 @@ class VisualEncoder(nn.Module):
         x = x.view(b * t, -1)
 
         # Dynamically create fc1 if not exist
-        if not hasattr(self, 'fc1_dynamic'):
-            self.fc1_dynamic = nn.Linear(x.size(1), 1024).to(x.device)
-            self.fc2_dynamic = nn.Linear(1024, Config.VISUAL_FEATURE_DIM).to(x.device)
+        self.ensure_dynamic_layers(x.size(1), x.device)
 
         x = F.relu(self.fc1_dynamic(x))
         x = self.dropout(x)
@@ -95,6 +98,30 @@ class VisualEncoder(nn.Module):
             features = features.permute(0, 2, 1)
 
         return features
+
+    def ensure_dynamic_layers(self, in_features, device=None):
+        """Create fc1_dynamic/fc2_dynamic (per-timestep projection) if they don't exist yet."""
+        if not hasattr(self, 'fc1_dynamic'):
+            self.fc1_dynamic = nn.Linear(in_features, 1024)
+            self.fc2_dynamic = nn.Linear(1024, Config.VISUAL_FEATURE_DIM)
+            if device is not None:
+                self.fc1_dynamic.to(device)
+                self.fc2_dynamic.to(device)
+
+
+def materialize_lazy_layers(model, state_dict):
+    """Create any lazily-built VisualEncoder layers present in state_dict before loading it.
+
+    VisualEncoder builds fc1_dynamic/fc2_dynamic on its first forward pass, so a freshly
+    constructed model has no such parameters and load_state_dict would reject (strict) or
+    silently drop (strict=False / key filtering) the trained weights.
+    """
+    suffix = '.fc1_dynamic.weight'
+    for key, tensor in state_dict.items():
+        if key.endswith(suffix):
+            encoder = model.get_submodule(key[:-len(suffix)])
+            device = next(encoder.parameters()).device
+            encoder.ensure_dynamic_layers(tensor.shape[1], device)
 
 
 class LipROI(nn.Module):

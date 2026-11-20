@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.config import Config
-from models.visual_encoder import EnhancedVisualEncoder
+from models.visual_encoder import EnhancedVisualEncoder, materialize_lazy_layers
 from models.sequence_model import HybridSequenceModel
 from src.language_model import ContextualLanguageModel
 from src.adaptive_fusion import MultiScaleAdaptiveFusion, ConfusionMatrixDecoder
@@ -284,10 +284,19 @@ class ModelFactory:
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         state_dict = checkpoint['model_state_dict']
 
+        # Create the lazily-built visual encoder layers first, otherwise their trained
+        # weights are filtered out below and replaced by random ones on the first forward.
+        materialize_lazy_layers(model, state_dict)
+
         # Filter out keys not in model or whose shapes do not match
         model_dict = model.state_dict()
         filtered_dict = {k: v for k, v in state_dict.items()
                          if k in model_dict and v.shape == model_dict[k].shape}
+
+        skipped = sorted(set(state_dict) - set(filtered_dict))
+        if skipped:
+            print(f"[load_pretrained_model] Skipped {len(skipped)} incompatible checkpoint keys, "
+                  f"e.g. {skipped[:5]}")
 
         # Load compatible weights only
         model.load_state_dict(filtered_dict, strict=False)

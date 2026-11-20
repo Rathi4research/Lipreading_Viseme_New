@@ -11,6 +11,7 @@ sys.path.append('models')
 
 from src.config import Config
 from models.fusion_network import VisemePhonemeAdaptiveModel
+from models.visual_encoder import materialize_lazy_layers
 
 
 def load_model(model_path):
@@ -27,8 +28,12 @@ def load_model(model_path):
         checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
 
         # Handle different checkpoint formats
+        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+        # Create lazily-built visual encoder layers so their trained weights are loaded
+        materialize_lazy_layers(model, state_dict)
+
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            model.load_state_dict(state_dict, strict=False)
             if 'epoch' in checkpoint:
                 print(f"✅ Loaded model from epoch {checkpoint['epoch']}")
         else:

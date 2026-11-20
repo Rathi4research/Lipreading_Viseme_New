@@ -1,7 +1,12 @@
 # Import project modules
-from src.config import Config
-import logging
 import os
+
+# On Apple Silicon (MPS), let ops that have no Metal kernel fall back to CPU instead of
+# erroring. Must be set before torch is imported; no effect on CUDA/CPU.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+from src.config import Config, detect_device
+import logging
 import torch
 
 import sys
@@ -57,15 +62,38 @@ def print_model_info(model):
     logger.info("=" * 60)
 
 
+def resolve_checkpoint_dir(args):
+    """Pick the checkpoint directory: --local-checkpoints > --checkpoint-dir > Config default."""
+    if args.local_checkpoints:
+        checkpoint_dir = Config.LOCAL_CHECKPOINT_DIR
+    elif args.checkpoint_dir:
+        checkpoint_dir = args.checkpoint_dir
+    else:
+        checkpoint_dir = Config.CHECKPOINT_DIR
+
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(
+            f"Cannot create checkpoint directory '{checkpoint_dir}' ({e}). "
+            f"The default is the Google Drive path used on Colab; when running locally pass "
+            f"--local-checkpoints (saves to ./{Config.LOCAL_CHECKPOINT_DIR}) or --checkpoint-dir PATH."
+        )
+    return checkpoint_dir
+
+
 def train_model(args):
     """Train the model"""
     logger.info("Starting model training...")
+
+    checkpoint_dir = resolve_checkpoint_dir(args)
 
     # Create data loaders
     train_loader, val_loader, test_loader = create_data_loaders(
         train_subjects=args.train_subjects,
         val_subjects=args.val_subjects,
-        test_subjects=args.test_subjects
+        test_subjects=args.test_subjects,
+        max_samples_per_subject=args.max_samples_per_subject
     )
 
     # Create model
@@ -83,7 +111,8 @@ def train_model(args):
     viseme_mapper.print_mappings()
 
     # Create trainer
-    trainer = LipReadingTrainer(model, train_loader, val_loader, test_loader)
+    trainer = LipReadingTrainer(model, train_loader, val_loader, test_loader,
+                                checkpoint_dir=checkpoint_dir)
 
     # Load checkpoint if specified
     if args.resume_from:
@@ -101,7 +130,8 @@ def evaluate_model(args):
     logger.info("Starting model evaluation...")
 
     # Create test data loader
-    _, _, test_loader = create_data_loaders(test_subjects=args.test_subjects)
+    _, _, test_loader = create_data_loaders(test_subjects=args.test_subjects,
+                                            max_samples_per_subject=args.max_samples_per_subject)
 
     # Load model
     if args.checkpoint_path:
@@ -166,8 +196,10 @@ def inference_demo(args):
         return
 
     # Create a small demo dataset
-    _, _, test_loader = create_data_loaders(test_subjects=['s3'])
+    _, _, test_loader = create_data_loaders(test_subjects=args.test_subjects,
+                                            max_samples_per_subject=args.max_samples_per_subject)
 
+    model = model.to(Config.DEVICE)
     model.eval()
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
@@ -258,7 +290,8 @@ def analyze_dataset(args):
     train_loader, val_loader, test_loader = create_data_loaders(
         train_subjects=args.train_subjects,
         val_subjects=args.val_subjects,
-        test_subjects=args.test_subjects
+        test_subjects=args.test_subjects,
+        max_samples_per_subject=args.max_samples_per_subject
     )
 
     # Dataset statistics
@@ -385,6 +418,25 @@ def main():
                         help='Batch size')
     parser.add_argument('--learning-rate', type=float, default=Config.LEARNING_RATE,
                         help='Learning rate')
+    parser.add_argument('--num-workers', type=int, default=Config.NUM_WORKERS,
+                        help='DataLoader worker processes (0 = load in the main process)')
+
+    # Checkpoint location
+    ckpt_group = parser.add_mutually_exclusive_group()
+    ckpt_group.add_argument('--local-checkpoints', action='store_true',
+                            help=f'Save checkpoints/metrics to ./{Config.LOCAL_CHECKPOINT_DIR} '
+                                 f'instead of the Google Drive default ({Config.CHECKPOINT_DIR})')
+    ckpt_group.add_argument('--checkpoint-dir', type=str,
+                            help='Save checkpoints/metrics to this directory')
+
+    # Data location / size
+    parser.add_argument('--data-dir', type=str, default=Config.DATA_DIR,
+                        help='Root holding videos/, alignments/ and preprocessed_lips/')
+    parser.add_argument('--frame-size', type=int,
+                        help='Square frame size fed to the model (e.g. 80 to match the '
+                             'preprocessed .npy crops); default from src/config.py')
+    parser.add_argument('--max-samples-per-subject', type=int,
+                        help='Use at most N utterances per speaker (quick/local runs)')
 
     # Inference configuration
     parser.add_argument('--demo-samples', type=int, default=5,
@@ -392,7 +444,7 @@ def main():
 
     # Device configuration
     parser.add_argument('--device', type=str, default='auto',
-                        help='Device to use (cuda/cpu/auto)')
+                        help='Device to use (cuda/mps/cpu/auto; auto picks cuda > mps > cpu)')
 
     args = parser.parse_args()
 
@@ -401,20 +453,23 @@ def main():
 
     # Set device
     if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = detect_device()
     else:
         device = args.device
     Config.DEVICE = device
 
-    # Update config with command line arguments
-    if hasattr(args, 'batch_size'):
-        Config.BATCH_SIZE = args.batch_size
-    if hasattr(args, 'learning_rate'):
-        Config.LEARNING_RATE = args.learning_rate
+    # Update config with command line arguments (must happen before any model/dataset is built)
+    Config.BATCH_SIZE = args.batch_size
+    Config.LEARNING_RATE = args.learning_rate
+    Config.NUM_WORKERS = args.num_workers
+    Config.set_data_dir(args.data_dir)
+    if args.frame_size:
+        Config.FRAME_WIDTH = Config.FRAME_HEIGHT = args.frame_size
 
     logger.info(f"Using device: {Config.DEVICE}")
     logger.info(f"Mode: {args.mode}")
     logger.info(f"Model type: {args.model_type}")
+    logger.info(f"Data dir: {Config.DATA_DIR} | Frame size: {Config.FRAME_HEIGHT}x{Config.FRAME_WIDTH}")
 
     # Execute based on mode
     try:

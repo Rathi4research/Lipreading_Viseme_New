@@ -298,10 +298,6 @@ class HierarchicalLanguageModel(nn.Module):
         assert num_heads is not None, "Cannot determine attention num_heads"
         assert actual_dim % num_heads == 0, f"embed_dim {actual_dim} not divisible by num_heads {num_heads}"
 
-        # 🔍 Debug before attention
-        print(
-            f"[HierLM] feeding into cross_attention: query={phoneme_features.shape}, key={word_features.shape}, value={word_features.shape}")
-
         # Now run attention. MultiheadAttention expects (batch, seq, embed) when batch_first=True
         attended_phonemes, attn_weights = self.cross_attention(
             phoneme_features,  # query
@@ -311,9 +307,6 @@ class HierarchicalLanguageModel(nn.Module):
 
         combined_features = attended_phonemes + word_features
         output_logits = self.fc_out(combined_features)
-
-        # 🔍 Final debug
-        print(f"[HierLM] combined_features: {combined_features.shape}, output_logits: {output_logits.shape}")
 
         word_probs = F.softmax(output_logits, dim=-1)
         return combined_features, word_probs
