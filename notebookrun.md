@@ -1,53 +1,36 @@
-# Lip Reading Viseme Training & Setup Guide
+# Running on Google Colab
 
-This guide outlines the precise workflow used to set up the environment, prepare the multi-speaker datasets, and execute training inside Google Colab.
+Use **`notebooks/LipReading_Colab_Orchestrator.ipynb`**. It only orchestrates: it clones the repo, then runs
+`scripts/preprocess.py` and `main.py` with command-line flags. It never edits repository files, so every
+change to the pipeline belongs in the code, not in notebook cells.
 
-## Repository Setup & Installation
-1. **Clone Repository**
-   ```bash
-   git clone https://github.com/Rathi4research/Lipreading_Viseme_New.git
-   cd Lipreading_Viseme_New
-   ```
-2. **Install Python Packages**
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. **Download Dlib Landmarks Predictor**
-   ```bash
-   wget http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
-   bunzip2 shape_predictor_68_face_landmarks.dat.bz2
-   ```
+(`LipReading_Viseme_resolved_code.ipynb` is the older notebook that patched source files at runtime; it is
+kept for reference only and does not match the current code.)
 
-## Dataset Structure & Extraction
-The dataset must be structured under the `/content/Lipreading_Viseme_New/data` folder as follows:
+## Steps
+1. Open the notebook in Colab and select a GPU runtime (*Runtime → Change runtime type → T4 GPU*).
+2. Edit **1. Settings**:
+   - `BRANCH` — the branch to run (default `advanced-preprocessing`).
+   - `RAW_DATA_DIR` — Drive folder with the raw GRID archives (`sN_videos.zip` / `sN.mpg_vcd.zip` for videos,
+     `sN.tar` / `sN_alignments.zip` for alignments). Default `MyDrive/Training_Artifacts`.
+   - `OUTPUT_DIR` — Drive folder for everything produced. Default `MyDrive/Lipreading_advanced_preprocessing`.
+   - `PREPROCESS_SPEAKERS`, crop settings, and the train/val/test speakers and hyperparameters.
+3. *Runtime → Run all*. After a disconnect, Run all again: finished speakers are skipped and training resumes
+   from the run's `last_model.pth`.
+
+## What ends up on Drive
 ```
-data/
-├── alignments/
-│   ├── s1/
-│   ├── s2/
-│   └── s3/
-└── videos/
-    ├── s1/
-    ├── s2/
-    └── s3/
+<OUTPUT_DIR>/
+├── preprocessed/<crop-mode>_scale<s>_<size>px/sN_preprocessed.tar.gz   # .npy crops + .meta.npz landmarks
+├── alignments/sN_alignments.tar.gz
+└── runs/<RUN_NAME>/   best_model.pth, last_model.pth, training_metrics.csv, test_results.json,
+                       training_curves.png, evaluation/, lipreading.log, tensorboard/, run_config.json
 ```
 
-If extracting from zip archives stored on Google Drive (under `MyDrive/Training_Artifacts/`):
-- Extract `s1_videos.zip`, `s2_videos.zip`, and `s3_videos.zip` directly into `data/videos/`.
-- Extract `s1_alignments.zip`, `s2_alignments.zip`, and `s3_alignments.zip` directly into `data/alignments/`.
-- Standardize the extracted directories so that folder names align perfectly (e.g. rename `s1_videos` to `s1` and `s1_alignments` to `s1`).
-
-## Performance Optimization
-To prevent the Google Colab session from crashing during dataset collation, **patch the data loader** to turn off multi-process worker overhead:
-```python
-# Inside src/data_loader.py, set num_workers=0
-train_loader = DataLoader(..., num_workers=0)
-```
-
-## GPU Training Command
-Before running the training command, ensure that **T4 GPU acceleration** is active under **Runtime > Change runtime type**.
-
-Run the training across the 3 subjects:
+## Using the preprocessed data locally
 ```bash
-python main.py train --model-type full --num-epochs 10 --batch-size 16 --train-subjects s1 --val-subjects s2 --test-subjects s3
+mkdir -p data/preprocessed_lips data/alignments
+tar -xzf sN_preprocessed.tar.gz -C data/preprocessed_lips
+tar -xzf sN_alignments.tar.gz   -C data/alignments
+python main.py train --local-checkpoints --train-subjects s1 --val-subjects s2 --test-subjects s2 --num-epochs 2
 ```

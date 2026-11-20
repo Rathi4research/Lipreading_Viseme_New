@@ -58,9 +58,10 @@ default, `--local-checkpoints` for `./checkpoints`, or `--checkpoint-dir PATH`. 
 `best_model.pth`, `last_model.pth` (every epoch), `checkpoint_epoch_N.pth` (every 5),
 `training_metrics.csv` (one row per epoch) and `test_results.json` into that directory.
 
-The Colab notebook (`LipReading_Viseme_resolved_code.ipynb`) is meant to be a thin orchestrator
-(GPU/Drive setup, data restore, invoking `scripts/preprocess.py` and `main.py`); code changes belong
-in the repo, not in notebook cells that patch source files.
+The Colab notebook (`notebooks/LipReading_Colab_Orchestrator.ipynb`, see `notebookrun.md`) is a thin
+orchestrator (GPU/Drive setup, raw-data extraction, invoking `scripts/preprocess.py` and `main.py`, saving
+outputs to Drive); code changes belong in the repo, not in notebook cells that patch source files.
+`LipReading_Viseme_resolved_code.ipynb` is the older, superseded notebook that did patch files.
 
 ## Data layout
 
