@@ -61,10 +61,43 @@ class Config:
 
     # Training parameters
     BATCH_SIZE = 16
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 3e-4            # peak learning rate (after warmup)
+    WEIGHT_DECAY = 1e-2             # AdamW (decoupled) weight decay
+    WARMUP_RATIO = 0.05             # share of all optimiser steps used for linear warmup
+    MIN_LR_RATIO = 0.01             # cosine decay ends at this fraction of the peak
+    GRAD_CLIP_NORM = 1.0
     NUM_EPOCHS = 100
-    PATIENCE = 10
-    NUM_WORKERS = 0  # DataLoader workers; 0 avoids Colab worker crashes
+    PATIENCE = 10                   # early stopping on the validation selection metric
+    NUM_WORKERS = 0                 # DataLoader workers (main.py: 2 on CUDA by default)
+    AMP = True                      # mixed precision; only takes effect on CUDA
+    SEED = 42
+
+    # Model structure (main.py --seq-model / --visual-pool / --gate)
+    SEQ_MODEL = 'hybrid'            # bilstm | transformer | hybrid | conformer
+    VISUAL_POOL = 'avg'             # avg (spatial average) | flatten (original, ~13M-param projection)
+    GATE = 'intrinsic-extrinsic'    # ambiguity | entropy | learned | hard | intrinsic-extrinsic
+
+    # Sentence-level CTC over characters (blank = index 0)
+    CTC_CHARS = " abcdefghijklmnopqrstuvwxyz"
+    CTC_BLANK = 0
+    BEAM_SIZE = 16                  # grammar-constrained CTC prefix beam search
+
+    # Loss weights. CTC is the main objective; the per-frame terms are auxiliary.
+    LOSS_WEIGHTS = {
+        'ctc': 1.0,
+        'viseme': 0.5,
+        'aux_viseme': 0.25,
+        'phoneme': 0.5,
+        'word': 0.25,               # forced to 0 for model_type visual_only
+        'fusion_reg': 0.01,         # gate-entropy regulariser (full model, soft gates)
+    }
+    SILENCE_LOSS_WEIGHT = 0.3       # per-frame losses: weight of silence frames (~50% of GRID frames)
+
+    # Frame quality (from scripts/preprocess.py .meta.npz)
+    MIN_DETECTED_RATIO = 0.5        # skip clips where a face was found in fewer frames than this
+    QUALITY_GAP_FRAMES = 10         # distance to the nearest detected frame is capped/normalised by this
+    QUALITY_JITTER_PX = 4.0         # crop-centre jump (crop px) mapped to 1.0
+    NUM_QUALITY_FEATURES = 3        # [missing/masked, gap to detection, crop jitter], 0 = reliable
 
     # Adaptive fusion parameters
     FUSION_ALPHA = 0.5  # Balance between visual and language model
@@ -103,10 +136,6 @@ class Config:
     UNKNOWN_SPEAKER_ID = NUM_SPEAKERS
     # Probability of replacing a training sample's speaker with UNKNOWN_SPEAKER_ID (trains that slot)
     SPEAKER_DROPOUT = 0.2
-
-    # Weight of the auxiliary viseme loss on the sequence model's own viseme head (that head's
-    # predictions drive the ambiguity scores and the language model input)
-    AUX_VISEME_LOSS_WEIGHT = 0.5
 
     # Device
     DEVICE = detect_device()

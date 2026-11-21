@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from src.config import Config
+from src.decoding import sentence_from_words, text_to_indices
 from src.viseme_mapping import viseme_mapper
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ GRID_WORD_TO_PHONEMES = {
 }
 
 
-def prepare_frames(frames, augment=False):
+def prepare_frames(frames, augment=False, return_mask=False):
     """Stored crops -> normalised model input (T, 1, FRAME_HEIGHT, FRAME_WIDTH) float tensor.
 
     Shared by training, evaluation and test.py so every path sees identical preprocessing.
@@ -60,6 +61,7 @@ def prepare_frames(frames, augment=False):
          augmenting (training), centred otherwise; smaller/other sizes are resized
       3. normalise: (x - Config.PIXEL_MEAN) / Config.PIXEL_STD
       4. augment (training only, fresh per call): horizontal flip, time masking
+    With return_mask=True also returns a (T,) bool tensor marking the time-masked frames.
     """
     x = torch.as_tensor(np.asarray(frames))
     x = x.float() / 255.0 if x.dtype == torch.uint8 else x.float()
@@ -80,54 +82,109 @@ def prepare_frames(frames, augment=False):
 
     x = (x - Config.PIXEL_MEAN) / Config.PIXEL_STD
 
+    masked = torch.zeros(x.shape[0], dtype=torch.bool)
     if augment:
         if torch.rand(1).item() < Config.AUG_FLIP_PROB:
             x = torch.flip(x, dims=[-1])
-        x = time_mask(x)
-    return x.contiguous()
+        x, masked = time_mask(x)
+    x = x.contiguous()
+    return (x, masked) if return_mask else x
 
 
-def time_mask(x):
+def time_mask(x, num_masks=None, max_len=None, generator=None):
     """Replace a few random short spans of frames with the clip's mean frame.
 
     Number of masks = AUG_TIME_MASKS_PER_SECOND x duration (TARGET_FPS frames per second), each up
     to AUG_TIME_MASK_MAX_FRAMES long (the "adaptive time masking" of the standard VSR recipes).
     Labels are left unchanged, so the model has to fill the gap from context.
+    Returns (masked frames, (T,) bool mask of the replaced frames).
     """
     num_frames = x.shape[0]
-    num_masks = int(round(Config.AUG_TIME_MASKS_PER_SECOND * num_frames / Config.TARGET_FPS))
-    max_len = min(Config.AUG_TIME_MASK_MAX_FRAMES, num_frames)
+    if num_masks is None:
+        num_masks = int(round(Config.AUG_TIME_MASKS_PER_SECOND * num_frames / Config.TARGET_FPS))
+    max_len = min(Config.AUG_TIME_MASK_MAX_FRAMES if max_len is None else max_len, num_frames)
+    masked = torch.zeros(num_frames, dtype=torch.bool)
     if num_masks <= 0 or max_len <= 0:
-        return x
+        return x, masked
     x = x.clone()
     mean_frame = x.mean(dim=0, keepdim=True)
     for _ in range(num_masks):
-        length = int(torch.randint(0, max_len + 1, (1,)))
+        length = int(torch.randint(0, max_len + 1, (1,), generator=generator))
         if length == 0:
             continue
-        start = int(torch.randint(0, num_frames - length + 1, (1,)))
+        start = int(torch.randint(0, num_frames - length + 1, (1,), generator=generator))
         x[start:start + length] = mean_frame
-    return x
+        masked[start:start + length] = True
+    return x, masked
+
+
+def meta_path_for(npy_path):
+    return npy_path[:-len('.npy')] + '.meta.npz' if npy_path else None
+
+
+def frame_quality(meta, num_frames):
+    """Per-frame unreliability signals from a preprocessing .meta.npz (0 = reliable).
+
+    Returns (quality (T, 3) float32, detected (T,) bool):
+      [:, 0] missing  - 1 where dlib found no face (landmarks were interpolated)
+      [:, 1] gap      - distance to the nearest detected frame / QUALITY_GAP_FRAMES, capped at 1
+      [:, 2] jitter   - jump of the crop centre since the previous frame, in crop pixels /
+                        QUALITY_JITTER_PX, capped at 1
+    With no metadata every frame is treated as reliable.
+    """
+    quality = np.zeros((num_frames, Config.NUM_QUALITY_FEATURES), dtype=np.float32)
+    detected = np.ones(num_frames, dtype=bool)
+    if meta is None:
+        return quality, detected
+
+    det = np.asarray(meta['detected'], dtype=bool)[:num_frames]
+    n = len(det)
+    detected[:n] = det
+    quality[:n, 0] = ~det
+    if det.any():
+        idx = np.flatnonzero(det)
+        dist = np.abs(np.arange(n)[:, None] - idx[None, :]).min(axis=1)
+        quality[:n, 1] = np.minimum(dist / Config.QUALITY_GAP_FRAMES, 1.0)
+    else:
+        quality[:n, 1] = 1.0
+
+    tr = np.asarray(meta['transforms'], dtype=np.float64)[:n]
+    if n > 1 and np.isfinite(tr).all():
+        size = float(meta['size']) if 'size' in meta else Config.PREPROCESS_SIZE
+        centre = np.array([size / 2.0, size / 2.0])
+        # crop centre in original-frame pixels, and crop pixels per original pixel
+        centres = np.stack([np.linalg.solve(m[:, :2], centre - m[:, 2]) for m in tr])
+        scale = np.hypot(tr[:, 0, 0], tr[:, 0, 1])
+        jump = np.linalg.norm(np.diff(centres, axis=0), axis=1) * scale[1:]
+        quality[1:n, 2] = np.minimum(jump / Config.QUALITY_JITTER_PX, 1.0)
+    return quality, detected
 
 
 class GRIDDataset(Dataset):
-    """GRID utterances as (frames, per-frame phoneme/viseme labels).
+    """GRID utterances as (frames, sentence target, per-frame labels, frame-quality signals).
 
     Frames come from the preprocessed lip crops in Config.PREPROCESSED_DIR
-    (<subject>/<utterance_id>.npy, produced by scripts/preprocess.py). If an utterance has no
-    .npy file, the raw video in Config.VIDEO_DIR is cropped on the fly with dlib instead (slow).
-    Samples are discovered from either source, so a local run only needs the .npy files and
-    the .align files — the raw videos are optional.
+    (<subject>/<utterance_id>.npy, produced by scripts/preprocess.py), with the per-frame
+    metadata in the matching .meta.npz when present. If an utterance has no .npy file, the raw
+    video in Config.VIDEO_DIR is cropped on the fly with dlib instead (slow). Clips in which a
+    face was detected in fewer than Config.MIN_DETECTED_RATIO of the frames are skipped.
+
+    corrupt_ratio (evaluation only): deterministically replaces roughly that share of each clip's
+    frames with the clip's mean frame (time-mask style) and flags them as unreliable — a
+    controlled test of robustness to bad frames.
     """
 
     def __init__(self, data_dir, subjects=['s1', 's2', 's3'], transform=None, max_samples_per_subject=None,
-                 augment=False):
+                 augment=False, corrupt_ratio=0.0, min_detected_ratio=None):
         self.data_dir = data_dir
         self.subjects = subjects
         self.transform = transform
         # Training-time augmentation (random crop, flip, time masking); keep False for val/test
         self.augment = augment
+        self.corrupt_ratio = corrupt_ratio
+        min_detected_ratio = Config.MIN_DETECTED_RATIO if min_detected_ratio is None else min_detected_ratio
         self.samples = []
+        self.skipped = []
 
         # dlib is only needed for the on-the-fly fallback; initialised lazily.
         self._dlib_ready = False
@@ -158,9 +215,20 @@ class GRIDDataset(Dataset):
                 align_path = os.path.join(align_dir, utterance_id + '.align')
                 if not os.path.exists(align_path):
                     continue
+                npy_path = os.path.join(npy_dir, utterance_id + '.npy') if utterance_id in npys else None
+                meta_path = meta_path_for(npy_path)
+                if meta_path and os.path.exists(meta_path):
+                    with np.load(meta_path) as meta:
+                        ratio = float(np.mean(meta['detected']))
+                    if ratio < min_detected_ratio:
+                        self.skipped.append((subject, utterance_id, ratio))
+                        continue
+                else:
+                    meta_path = None
                 subject_samples.append({
                     'video_path': videos.get(utterance_id),
-                    'npy_path': os.path.join(npy_dir, utterance_id + '.npy') if utterance_id in npys else None,
+                    'npy_path': npy_path,
+                    'meta_path': meta_path,
                     'align_path': align_path,
                     'subject': subject,
                     'utterance_id': utterance_id
@@ -170,7 +238,9 @@ class GRIDDataset(Dataset):
                 subject_samples = subject_samples[:max_samples_per_subject]
             self.samples.extend(subject_samples)
 
-        print(f"Loaded {len(self.samples)} samples from subjects {subjects}")
+        skipped = f", skipped {len(self.skipped)} with face detected in < {min_detected_ratio:.0%} of frames" \
+            if self.skipped else ""
+        print(f"Loaded {len(self.samples)} samples from subjects {subjects}{skipped}")
 
     def __len__(self):
         return len(self.samples)
@@ -194,40 +264,62 @@ class GRIDDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         align_path = sample['align_path']
+        T = Config.SEQUENCE_LENGTH
 
         # Truncate to SEQUENCE_LENGTH, then crop/normalise/augment the real frames only
-        frames = self._load_frames(sample)[:Config.SEQUENCE_LENGTH]
+        frames = self._load_frames(sample)[:T]
         num_valid_frames = len(frames)
-        video_tensor = prepare_frames(frames, augment=self.augment)
+        video_tensor, masked = prepare_frames(frames, augment=self.augment, return_mask=True)
+
+        meta = None
+        if sample.get('meta_path'):
+            with np.load(sample['meta_path']) as m:
+                meta = {k: m[k] for k in ('detected', 'transforms', 'size')}
+        quality, detected = frame_quality(meta, num_valid_frames)
+        quality = torch.from_numpy(quality)
+        detected = torch.from_numpy(detected)
+
+        if self.corrupt_ratio > 0:
+            g = torch.Generator().manual_seed(idx)
+            num_masks = max(1, int(round(self.corrupt_ratio * num_valid_frames / 8)))
+            video_tensor, corrupted = time_mask(video_tensor, num_masks=num_masks, max_len=12, generator=g)
+            masked = masked | corrupted
+
+        # Frames replaced by time masking carry no visual evidence: flag them as unreliable
+        # (the extrinsic part of the fusion gate learns from this signal)
+        quality[masked, 0] = 1.0
 
         # Pad to SEQUENCE_LENGTH with zeros (= the mean pixel after normalisation); these frames
         # get label -1 below and are ignored by the losses and metrics
-        if num_valid_frames < Config.SEQUENCE_LENGTH:
-            padding = torch.zeros((Config.SEQUENCE_LENGTH - num_valid_frames, *video_tensor.shape[1:]))
+        if num_valid_frames < T:
+            padding = torch.zeros((T - num_valid_frames, *video_tensor.shape[1:]))
             video_tensor = torch.cat((video_tensor, padding), dim=0)
+            quality = torch.cat((quality, torch.zeros(T - num_valid_frames, quality.shape[1])), dim=0)
+            detected = torch.cat((detected, torch.zeros(T - num_valid_frames, dtype=torch.bool)), dim=0)
 
         # Per-frame labels (phonemes, visemes, words); padding frames are -1
         phonemes, words, visemes, word_labels = self.load_alignment(align_path, num_valid_frames)
 
-        # Convert to tensors
-        phonemes_tensor = torch.LongTensor(phonemes)
-        visemes_tensor = torch.LongTensor(visemes)
-        word_labels_tensor = torch.LongTensor(word_labels)
+        # Sentence-level CTC target (characters of the spoken words)
+        sentence = sentence_from_words(words)
 
         # Ground-truth ambiguity scores — for analysis/metrics only, never a model input
-        ambiguity_scores = [viseme_mapper.get_ambiguity_score(v) for v in visemes]
-        ambiguity_tensor = torch.FloatTensor(ambiguity_scores)
+        ambiguity_scores = [viseme_mapper.get_ambiguity_score(v) if v >= 0 else 0.0 for v in visemes]
 
-        # Apply transforms if provided
         if self.transform:
             video_tensor = self.transform(video_tensor)
 
         return {
             'frames': video_tensor,
-            'phonemes': phonemes_tensor,
-            'visemes': visemes_tensor,
-            'word_labels': word_labels_tensor,
-            'ambiguity_scores': ambiguity_tensor,
+            'length': num_valid_frames,
+            'phonemes': torch.LongTensor(phonemes),
+            'visemes': torch.LongTensor(visemes),
+            'word_labels': torch.LongTensor(word_labels),
+            'ambiguity_scores': torch.FloatTensor(ambiguity_scores),
+            'quality': quality,
+            'detected': detected,
+            'sentence': sentence,
+            'target': torch.LongTensor(text_to_indices(sentence)),
             'words': words,
             'subject': sample['subject'],
             'utterance_id': sample['utterance_id']
@@ -324,55 +416,54 @@ class GRIDDataset(Dataset):
 
 
 def collate_fn(batch):
-    """Custom collate function for DataLoader"""
-    # Ensure all frames have the same sequence length by padding to max_len in batch
-    max_len = max([item['frames'].shape[0] for item in batch])
-
-    processed_frames = []
-    for item in batch:
-        f = item['frames']
-        if f.shape[0] < max_len:
-            # Pad along the temporal dimension (dim 0)
-            pad = torch.zeros((max_len - f.shape[0], f.shape[1], f.shape[2], f.shape[3]), dtype=f.dtype)
-            f = torch.cat([f, pad], dim=0)
-        elif f.shape[0] > max_len:
-            f = f[:max_len]
-        processed_frames.append(f)
-
-    frames = torch.stack(processed_frames)
-    phonemes = torch.stack([item['phonemes'] for item in batch])
-    visemes = torch.stack([item['visemes'] for item in batch])
-    word_labels = torch.stack([item['word_labels'] for item in batch])
-    ambiguity_scores = torch.stack([item['ambiguity_scores'] for item in batch])
+    """Stack a batch; CTC targets are padded with 0 and come with their lengths."""
+    targets = [item['target'] for item in batch]
+    padded_targets = torch.zeros(len(batch), max(len(t) for t in targets), dtype=torch.long)
+    for i, t in enumerate(targets):
+        padded_targets[i, :len(t)] = t
 
     return {
-        'frames': frames,
-        'phonemes': phonemes,
-        'visemes': visemes,
-        'word_labels': word_labels,
-        'ambiguity_scores': ambiguity_scores,
+        'frames': torch.stack([item['frames'] for item in batch]),
+        'lengths': torch.tensor([item['length'] for item in batch], dtype=torch.long),
+        'phonemes': torch.stack([item['phonemes'] for item in batch]),
+        'visemes': torch.stack([item['visemes'] for item in batch]),
+        'word_labels': torch.stack([item['word_labels'] for item in batch]),
+        'ambiguity_scores': torch.stack([item['ambiguity_scores'] for item in batch]),
+        'quality': torch.stack([item['quality'] for item in batch]),
+        'detected': torch.stack([item['detected'] for item in batch]),
+        'targets': padded_targets,
+        'target_lengths': torch.tensor([len(t) for t in targets], dtype=torch.long),
+        'sentences': [item['sentence'] for item in batch],
         'words': [item['words'] for item in batch],
         'subjects': [item['subject'] for item in batch],
         'utterance_ids': [item['utterance_id'] for item in batch]
     }
 
 
+def make_loader(dataset, shuffle):
+    """DataLoader with the project's collate function and device-appropriate loading options."""
+    workers = Config.NUM_WORKERS
+    return DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=shuffle, collate_fn=collate_fn,
+                      num_workers=workers, pin_memory=str(Config.DEVICE).startswith('cuda'),
+                      persistent_workers=workers > 0)
+
+
 def create_data_loaders(train_subjects=['s1'], val_subjects=['s2'], test_subjects=['s3'],
-                        max_samples_per_subject=None):
+                        max_samples_per_subject=None, test_corrupt_ratio=0.0):
     """Create train, validation, and test data loaders.
 
     max_samples_per_subject caps utterances per speaker (e.g. for a quick local run).
+    test_corrupt_ratio applies the controlled frame corruption to the test split only.
     """
 
-    def make(subjects, shuffle, augment):
-        dataset = GRIDDataset(Config.DATA_DIR, subjects=subjects,
-                              max_samples_per_subject=max_samples_per_subject, augment=augment)
-        return DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=shuffle,
-                          collate_fn=collate_fn, num_workers=Config.NUM_WORKERS)
+    def make(subjects, shuffle, augment, corrupt=0.0):
+        dataset = GRIDDataset(Config.DATA_DIR, subjects=subjects, max_samples_per_subject=max_samples_per_subject,
+                              augment=augment, corrupt_ratio=corrupt)
+        return make_loader(dataset, shuffle)
 
     # Augmentation only ever applies to the training split (Config.AUGMENT, main.py --no-augment)
     train_loader = make(train_subjects, shuffle=True, augment=Config.AUGMENT)
     val_loader = make(val_subjects, shuffle=False, augment=False)
-    test_loader = make(test_subjects, shuffle=False, augment=False)
+    test_loader = make(test_subjects, shuffle=False, augment=False, corrupt=test_corrupt_ratio)
 
     return train_loader, val_loader, test_loader

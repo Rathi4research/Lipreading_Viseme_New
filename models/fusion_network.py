@@ -1,97 +1,89 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from src.config import Config
+from src.decoding import NUM_CLASSES as CTC_CLASSES
 from models.visual_encoder import EnhancedVisualEncoder, upgrade_legacy_state_dict
-from models.sequence_model import HybridSequenceModel
+from models.sequence_model import SEQ_MODELS, build_sequence_encoder
 from src.language_model import ContextualLanguageModel
-from src.adaptive_fusion import MultiScaleAdaptiveFusion, ConfusionMatrixDecoder
+from src.adaptive_fusion import GATES, MultiScaleAdaptiveFusion, PriorGuidedPhonemeHead
 from src.viseme_mapping import viseme_mapper
 
 MODEL_TYPES = ('full', 'baseline', 'visual_only')
+SIL_VISEME = viseme_mapper.get_viseme('sil')
+SIL_PHONEME = Config.PHONEMES.index('sil')
+SIL_WORD = Config.VOCABULARY.index('sil')
 
 
 class VisemePhonemeAdaptiveModel(nn.Module):
     """
-    Enhanced Viseme-Phoneme Adaptive Language Model for Automated Lip Reading
+    Viseme-Phoneme Adaptive Model for lip reading.
 
-    model_type selects the variant and is used for both training and evaluation:
-      - 'full':        visual + language features combined by ambiguity-gated multi-scale fusion
-      - 'baseline':    visual + language features combined by a plain (non-adaptive) linear fusion
-      - 'visual_only': no language model; visual sequence features go straight to the classifier
+    frames -> lip attention + 3D CNN -> sequence encoder (--seq-model) -> fused with a language model
+    (--model-type, --gate) -> heads:
+      ctc_head        sentence-level CTC over characters (main objective; decoded to text)
+      viseme head     per-frame visemes (auxiliary)
+      phoneme head    per-frame phonemes from the fused features + viseme-to-phoneme prior (auxiliary)
+      word logits     per-frame words from the language model (auxiliary)
 
-    Nothing derived from the targets is fed into the network. The per-frame ambiguity scores that
-    drive the fusion gate, and the soft phoneme sequence fed to the language model, both come from
-    the sequence model's own (auxiliary) viseme predictions, which are trained with an extra loss.
+    model_type:
+      full         visual + language features combined by the multi-scale gated fusion (--gate)
+      baseline     visual + language features combined by a plain linear fusion
+      visual_only  no language model
+
+    Only frames, clip lengths, speaker ids and preprocessing frame-quality signals are inputs.
+    The ambiguity score and the language model's soft-phoneme input come from the model's own
+    auxiliary viseme prediction, never from labels.
     """
 
-    def __init__(self, num_visemes=12, num_phonemes=len(Config.PHONEMES), model_type='full'):
-        super(VisemePhonemeAdaptiveModel, self).__init__()
-
+    def __init__(self, num_visemes=12, num_phonemes=len(Config.PHONEMES), model_type='full',
+                 seq_model=None, visual_pool=None, gate=None):
+        super().__init__()
+        seq_model = seq_model or Config.SEQ_MODEL
+        visual_pool = visual_pool or Config.VISUAL_POOL
+        gate = gate or Config.GATE
         if model_type not in MODEL_TYPES:
             raise ValueError(f"model_type must be one of {MODEL_TYPES}, got {model_type!r}")
+        if seq_model not in SEQ_MODELS:
+            raise ValueError(f"seq_model must be one of {SEQ_MODELS}, got {seq_model!r}")
+        if gate not in GATES:
+            raise ValueError(f"gate must be one of {GATES}, got {gate!r}")
         self.model_type = model_type
-        # Speakers seen in training (set by the trainer, stored in checkpoints). Any other speaker
-        # is mapped to the language model's "unknown speaker" embedding.
+        self.model_config = {'model_type': model_type, 'seq_model': seq_model,
+                             'visual_pool': visual_pool, 'gate': gate}
+        # Speakers seen in training (set by the trainer, stored in checkpoints); others use the
+        # language model's "unknown speaker" embedding.
         self.known_speakers = []
-
         self.num_visemes = num_visemes
         self.num_phonemes = num_phonemes
+        H = Config.HIDDEN_DIM
 
-        # Visual processing pipeline
-        self.visual_encoder = EnhancedVisualEncoder()
+        self.visual_encoder = EnhancedVisualEncoder(pool=visual_pool)
+        self.sequence_model = build_sequence_encoder(seq_model, Config.VISUAL_FEATURE_DIM, H)
+        self.aux_viseme_head = nn.Linear(H, num_visemes)
 
-        # Sequence modeling (its viseme head is the auxiliary prediction used for ambiguity/LM input)
-        self.sequence_model = HybridSequenceModel(
-            input_dim=Config.VISUAL_FEATURE_DIM,
-            hidden_dim=Config.HIDDEN_DIM,
-            num_visemes=num_visemes
-        )
+        if model_type in ('full', 'baseline'):
+            self.language_model = ContextualLanguageModel(num_speakers=Config.NUM_SPEAKERS)
+        if model_type == 'full':
+            self.adaptive_fusion = MultiScaleAdaptiveFusion(H, H * 2, H, gate)
+        elif model_type == 'baseline':
+            self.static_fusion = nn.Sequential(nn.Linear(H * 3, H), nn.ReLU(), nn.Dropout(Config.DROPOUT_RATE))
 
-        # Language model
-        self.language_model = ContextualLanguageModel(num_speakers=Config.NUM_SPEAKERS)
+        self.viseme_classifier = nn.Linear(H, num_visemes)
+        self.phoneme_head = PriorGuidedPhonemeHead(H, num_visemes, num_phonemes)
+        self.ctc_head = nn.Linear(H, CTC_CLASSES)
 
-        # Adaptive fusion ('full')
-        self.adaptive_fusion = MultiScaleAdaptiveFusion(
-            visual_dim=Config.HIDDEN_DIM,  # From sequence model
-            language_dim=Config.HIDDEN_DIM,
-            num_visemes=num_visemes
-        )
-        # Maps the fusion's num_visemes-dim output up to HIDDEN_DIM
-        self.fused_proj = nn.Linear(num_visemes, Config.HIDDEN_DIM)
-
-        # Plain fusion ('baseline'): concat(visual 256, language 512) -> 256
-        self.static_fusion = nn.Sequential(
-            nn.Linear(Config.HIDDEN_DIM * 3, Config.HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Dropout(Config.DROPOUT_RATE),
-        )
-
-        # Confusion matrix decoder for phoneme disambiguation
-        self.confusion_decoder = ConfusionMatrixDecoder(
-            num_visemes=num_visemes,
-            num_phonemes=num_phonemes
-        )
-
-        # Final viseme classifier
-        self.viseme_classifier = nn.Linear(Config.HIDDEN_DIM, num_visemes)
-
-        # Ambiguity score per viseme id (for vectorized lookup)
         self.register_buffer('ambiguity_table', torch.tensor(viseme_mapper.ambiguity_lookup(), dtype=torch.float))
 
-        # Loss weights
-        self.register_buffer('viseme_loss_weight', torch.tensor(1.0))
-        self.register_buffer('phoneme_loss_weight', torch.tensor(1.0))
-        self.register_buffer('language_loss_weight', torch.tensor(0.0 if model_type == 'visual_only' else 0.5))
-        self.register_buffer('aux_viseme_loss_weight', torch.tensor(Config.AUX_VISEME_LOSS_WEIGHT))
+        self.loss_weights = dict(Config.LOSS_WEIGHTS)
+        if model_type == 'visual_only':
+            self.loss_weights['word'] = 0.0
+        self.uses_soft_gate = model_type == 'full' and gate != 'hard'
 
     # ------------------------------------------------------------------ helpers
     def speaker_ids_for(self, subjects, device=None):
-        """Speaker-embedding ids for a list of subject names ('s1', ...).
-
-        Speakers not seen in training map to the 'unknown speaker' slot. If known_speakers is
-        empty (e.g. a model built outside the trainer), every GRID speaker is treated as known.
-        """
+        """Speaker-embedding ids for subject names; speakers not seen in training -> unknown slot."""
         ids = []
         for s in subjects:
             if s in Config.SPEAKER_TO_ID and (not self.known_speakers or s in self.known_speakers):
@@ -100,186 +92,178 @@ class VisemePhonemeAdaptiveModel(nn.Module):
                 ids.append(Config.UNKNOWN_SPEAKER_ID)
         return torch.tensor(ids, dtype=torch.long, device=device)
 
-    def _calculate_ambiguity_scores(self, viseme_sequence):
-        """Ambiguity score per position of a (B, T) viseme-id tensor (-1 / padding -> 0)"""
-        valid = viseme_sequence >= 0
-        scores = self.ambiguity_table[viseme_sequence.clamp_min(0)]
-        return scores * valid
+    @staticmethod
+    def padding_mask(lengths, seq_len):
+        """(B, T) bool, True on padding frames"""
+        if lengths is None:
+            return None
+        return torch.arange(seq_len, device=lengths.device).unsqueeze(0) >= lengths.unsqueeze(1)
 
     # ------------------------------------------------------------------ forward
-    def forward(self, frames, phoneme_targets=None, word_targets=None,
-                speaker_ids=None, ambiguity_scores=None, model_type=None):
+    def forward(self, frames, lengths=None, speaker_ids=None, quality=None, ambiguity_scores=None):
         """
         Args:
-            frames: (B, T, H, W) or (B, T, 1, H, W)
-            phoneme_targets, word_targets: accepted for backward compatibility and ignored —
-                targets must never be model inputs.
+            frames: (B, T, 1, H, W) or (B, T, H, W)
+            lengths: (B,) real number of frames per clip (padding after that)
             speaker_ids: (B,) speaker-embedding ids (see speaker_ids_for)
-            ambiguity_scores: optional (B, T) override for analysis/ablation. By default they are
-                computed from the model's own auxiliary viseme predictions. Do not pass scores
-                derived from the ground-truth visemes when measuring accuracy (label leak).
-            model_type: override self.model_type (normally leave as None)
+            quality: (B, T, NUM_QUALITY_FEATURES) frame unreliability signals (0 = reliable); zeros if None
+            ambiguity_scores: optional (B, T) override for analysis/ablation only (never ground truth
+                when measuring accuracy)
         """
-        model_type = model_type or self.model_type
-        seq_len = frames.shape[1]
+        B, T = frames.shape[:2]
+        if lengths is not None:
+            lengths = lengths.to(frames.device)
+        pad_mask = self.padding_mask(lengths, T)
+        if quality is None:
+            quality = frames.new_zeros(B, T, Config.NUM_QUALITY_FEATURES)
 
-        # 1. Visual feature extraction
         visual_features = self.visual_encoder(frames)
+        sequence_hidden = self.sequence_model(visual_features, lengths, pad_mask)
+        aux_viseme_logits = self.aux_viseme_head(sequence_hidden)
+        aux_viseme_probs = F.softmax(aux_viseme_logits.float(), dim=-1).detach()
 
-        # 2. Visual sequence modeling (+ auxiliary viseme prediction)
-        aux_viseme_logits, sequence_hidden = self.sequence_model(visual_features)
-        aux_viseme_probs = F.softmax(aux_viseme_logits, dim=-1).detach()
-
-        # 3. Ambiguity scores: expected ambiguity under the model's own viseme distribution
         if ambiguity_scores is None:
             ambiguity_scores = torch.matmul(aux_viseme_probs, self.ambiguity_table)
+        entropy = -(aux_viseme_probs * torch.log(aux_viseme_probs + 1e-8)).sum(-1) / torch.log(
+            torch.tensor(float(self.num_visemes)))
 
-        # 4. Language model on the model's own soft phoneme estimate (viseme probs x prior)
-        language_features = None
-        word_logits = None
-        if model_type in ('full', 'baseline'):
-            soft_phonemes = torch.matmul(aux_viseme_probs, self.confusion_decoder.confusion_matrix)
+        language_features = word_logits = None
+        if self.model_type in ('full', 'baseline'):
+            soft_phonemes = torch.matmul(aux_viseme_probs, self.phoneme_head.confusion_matrix)
             language_features, word_logits = self.language_model(
-                phoneme_probs=soft_phonemes,
-                speaker_ids=speaker_ids,
-                sequence_length=seq_len
-            )
+                phoneme_probs=soft_phonemes, speaker_ids=speaker_ids, sequence_length=T,
+                lengths=lengths, pad_mask=pad_mask)
 
-        # 5. Fusion
         fusion_info = {'fusion_weights': None, 'scale_attention_weights': None}
-        if model_type == 'full':
-            fused_output, fusion_info = self.adaptive_fusion(
-                sequence_hidden, language_features, ambiguity_scores
-            )
-            fused_hidden = self.fused_proj(fused_output)  # num_visemes -> HIDDEN_DIM
-        elif model_type == 'baseline':
-            fused_hidden = self.static_fusion(torch.cat([sequence_hidden, language_features], dim=-1))
-        else:  # visual_only
-            fused_hidden = sequence_hidden
+        if self.model_type == 'full':
+            signals = {'ambiguity': ambiguity_scores.to(sequence_hidden.dtype),
+                       'entropy': entropy.to(sequence_hidden.dtype),
+                       'quality': quality.to(sequence_hidden.dtype)}
+            fused, fusion_info = self.adaptive_fusion(sequence_hidden, language_features, signals, pad_mask)
+        elif self.model_type == 'baseline':
+            fused = self.static_fusion(torch.cat([sequence_hidden, language_features], dim=-1))
+        else:
+            fused = sequence_hidden
 
-        # 6. Viseme classification and viseme -> phoneme decoding
-        viseme_logits = self.viseme_classifier(fused_hidden)
-        phoneme_logits = self.confusion_decoder(viseme_logits)  # -> (B, T, num_phonemes)
+        viseme_logits = self.viseme_classifier(fused)
+        phoneme_logits = self.phoneme_head(fused, viseme_logits)
+        ctc_log_probs = F.log_softmax(self.ctc_head(fused).float(), dim=-1)
 
         return {
-            'viseme_logits': viseme_logits,
+            'ctc_log_probs': ctc_log_probs,
+            'viseme_logits': viseme_logits.float(),
             'phoneme_logits': phoneme_logits,
-            'aux_viseme_logits': aux_viseme_logits,
-            'word_logits': word_logits,
-            'visual_features': visual_features,
-            'sequence_hidden': sequence_hidden,
-            'language_features': language_features,
-            'fusion_weights': fusion_info.get('fusion_weights', None),
-            'scale_attention': fusion_info.get('scale_attention_weights', None),
+            'aux_viseme_logits': aux_viseme_logits.float(),
+            'word_logits': None if word_logits is None else word_logits.float(),
+            'lengths': lengths,
+            'fusion_weights': fusion_info.get('fusion_weights'),
+            'scale_attention': fusion_info.get('scale_attention_weights'),
+            'intrinsic_logit': fusion_info.get('intrinsic_logit'),
+            'extrinsic_logit': fusion_info.get('extrinsic_logit'),
             'ambiguity_scores': ambiguity_scores,
-            'confusion_matrix': self.confusion_decoder.get_confusion_matrix()
+            'entropy': entropy,
         }
+
+    # ------------------------------------------------------------------ loss
+    @staticmethod
+    def _frame_ce(logits, labels, frame_ok, sil_label):
+        """Cross-entropy averaged over usable frames, silence frames down-weighted."""
+        ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.clamp_min(0).reshape(-1),
+                             reduction='none').view_as(labels)
+        weight = frame_ok.float() * torch.where(labels == sil_label, Config.SILENCE_LOSS_WEIGHT, 1.0)
+        return (ce * weight).sum() / weight.sum().clamp_min(1.0)
 
     def compute_loss(self, predictions, targets):
         """
-        Multi-task loss.
-
-        targets: dict with per-frame 'visemes', 'phonemes' and optionally 'words' (word-vocabulary
-        index per frame); -1 marks padding frames and is ignored.
+        targets: dict with
+          'targets' (B, S), 'target_lengths' (B,)   CTC character targets
+          'visemes', 'phonemes', 'words' (B, T)     per-frame labels, -1 on padding
+          'detected' (B, T) optional                frames with a real face detection; frames without
+                                                     one are left out of the per-frame losses
         """
         losses = {}
+        w = self.loss_weights
 
-        if 'visemes' in targets:
-            visemes = targets['visemes'].reshape(-1)
-            losses['viseme_loss'] = F.cross_entropy(
-                predictions['viseme_logits'].reshape(-1, self.num_visemes), visemes, ignore_index=-1)
-            losses['aux_viseme_loss'] = F.cross_entropy(
-                predictions['aux_viseme_logits'].reshape(-1, self.num_visemes), visemes, ignore_index=-1)
+        # Sentence-level CTC (on CPU for Apple MPS, which has no CTC kernel)
+        log_probs = predictions['ctc_log_probs'].transpose(0, 1)  # (T, B, C)
+        lengths = predictions['lengths']
+        if lengths is None:
+            lengths = torch.full((log_probs.size(1),), log_probs.size(0), dtype=torch.long)
+        ctc_device = 'cpu' if log_probs.device.type == 'mps' else log_probs.device
+        losses['ctc_loss'] = F.ctc_loss(
+            log_probs.to(ctc_device), targets['targets'].to(ctc_device), lengths.to(ctc_device),
+            targets['target_lengths'].to(ctc_device), blank=Config.CTC_BLANK, zero_infinity=True
+        ).to(log_probs.device)
 
-        if 'phonemes' in targets:
-            losses['phoneme_loss'] = F.cross_entropy(
-                predictions['phoneme_logits'].reshape(-1, self.num_phonemes),
-                targets['phonemes'].reshape(-1), ignore_index=-1)
+        visemes = targets['visemes']
+        frame_ok = visemes >= 0
+        if targets.get('detected') is not None:
+            frame_ok = frame_ok & targets['detected'].to(frame_ok.device)
 
-        if targets.get('words') is not None and predictions['word_logits'] is not None:
-            losses['word_loss'] = F.cross_entropy(
-                predictions['word_logits'].reshape(-1, len(Config.VOCABULARY)),
-                targets['words'].reshape(-1), ignore_index=-1)
+        losses['viseme_loss'] = self._frame_ce(predictions['viseme_logits'], visemes, frame_ok, SIL_VISEME)
+        losses['aux_viseme_loss'] = self._frame_ce(predictions['aux_viseme_logits'], visemes, frame_ok, SIL_VISEME)
+        losses['phoneme_loss'] = self._frame_ce(predictions['phoneme_logits'], targets['phonemes'], frame_ok,
+                                                SIL_PHONEME)
+        if predictions['word_logits'] is not None and targets.get('words') is not None and w['word'] > 0:
+            losses['word_loss'] = self._frame_ce(predictions['word_logits'], targets['words'], frame_ok, SIL_WORD)
 
-        # Adaptive fusion regularization (entropy of the gate; pushes towards decisive gating)
-        if predictions['fusion_weights'] is not None:
-            fusion_weights_list = predictions['fusion_weights']
-            fusion_reg_total = 0.0
-            for fw in fusion_weights_list:  # fw: (B, T, 2)
-                fusion_reg_total += -torch.mean(torch.sum(fw * torch.log(fw + 1e-8), dim=-1))
-            losses['fusion_reg'] = 0.01 * fusion_reg_total / len(fusion_weights_list)
+        # Gate-entropy regulariser: pushes the soft gate to commit to vision or language
+        if self.uses_soft_gate and predictions['fusion_weights'] is not None:
+            valid = (visemes >= 0).float()
+            reg = 0.0
+            for fw in predictions['fusion_weights']:
+                ent = -(fw * torch.log(fw + 1e-8)).sum(-1)
+                reg = reg + (ent * valid).sum() / valid.sum().clamp_min(1.0)
+            losses['fusion_reg'] = reg / len(predictions['fusion_weights'])
 
-        total_loss = 0
-        if 'viseme_loss' in losses:
-            total_loss = total_loss + self.viseme_loss_weight * losses['viseme_loss']
-            total_loss = total_loss + self.aux_viseme_loss_weight * losses['aux_viseme_loss']
-        if 'phoneme_loss' in losses:
-            total_loss = total_loss + self.phoneme_loss_weight * losses['phoneme_loss']
-        if 'word_loss' in losses:
-            total_loss = total_loss + self.language_loss_weight * losses['word_loss']
-        if 'fusion_reg' in losses:
-            total_loss = total_loss + losses['fusion_reg']
-
-        losses['total_loss'] = total_loss
+        key = {'ctc_loss': 'ctc', 'viseme_loss': 'viseme', 'aux_viseme_loss': 'aux_viseme',
+               'phoneme_loss': 'phoneme', 'word_loss': 'word', 'fusion_reg': 'fusion_reg'}
+        losses['total_loss'] = sum(w[key[name]] * value for name, value in losses.items())
         return losses
 
-    def predict(self, frames, speaker_ids=None, model_type=None):
+    # ------------------------------------------------------------------ inference
+    def predict(self, frames, lengths=None, speaker_ids=None, quality=None):
+        from src.decoding import constrained_decode, greedy_decode
         self.eval()
         with torch.no_grad():
-            predictions = self.forward(frames, speaker_ids=speaker_ids, model_type=model_type)
-
+            p = self.forward(frames, lengths=lengths, speaker_ids=speaker_ids, quality=quality)
+            lp = p['ctc_log_probs'].cpu().numpy()
+            lens = p['lengths'].cpu().tolist() if p['lengths'] is not None else [lp.shape[1]] * lp.shape[0]
             return {
-                'viseme_predictions': torch.argmax(predictions['viseme_logits'], dim=-1),
-                'phoneme_predictions': torch.argmax(predictions['phoneme_logits'], dim=-1),
-                'word_predictions': (torch.argmax(predictions['word_logits'], dim=-1)
-                                     if predictions['word_logits'] is not None else None),
-                'viseme_probabilities': F.softmax(predictions['viseme_logits'], dim=-1),
-                'phoneme_probabilities': F.softmax(predictions['phoneme_logits'], dim=-1),
-                'ambiguity_scores': predictions['ambiguity_scores'],
-                'fusion_weights': predictions['fusion_weights']
+                'greedy_text': [greedy_decode(lp[i], lens[i]) for i in range(lp.shape[0])],
+                'constrained_text': [constrained_decode(lp[i], lens[i]) for i in range(lp.shape[0])],
+                'viseme_predictions': torch.argmax(p['viseme_logits'], dim=-1),
+                'phoneme_predictions': torch.argmax(p['phoneme_logits'], dim=-1),
+                'viseme_probabilities': F.softmax(p['viseme_logits'], dim=-1),
+                'phoneme_probabilities': F.softmax(p['phoneme_logits'], dim=-1),
+                'ambiguity_scores': p['ambiguity_scores'],
+                'fusion_weights': p['fusion_weights'],
             }
-
-    def get_attention_weights(self, frames, speaker_ids=None):
-        """Get attention and fusion weights for visualization"""
-        predictions = self.forward(frames, speaker_ids=speaker_ids)
-
-        return {
-            'fusion_weights': predictions['fusion_weights'],
-            'scale_attention': predictions['scale_attention'],
-            'ambiguity_scores': predictions['ambiguity_scores'],
-            'confusion_matrix': predictions['confusion_matrix']
-        }
 
 
 class ModelFactory:
-    """Factory class for creating different model configurations"""
+    """Builds and loads model variants"""
 
     @staticmethod
-    def create(model_type='full'):
-        return VisemePhonemeAdaptiveModel(model_type=model_type)
+    def create(model_type='full', seq_model=None, visual_pool=None, gate=None):
+        return VisemePhonemeAdaptiveModel(model_type=model_type, seq_model=seq_model,
+                                          visual_pool=visual_pool, gate=gate)
 
     @staticmethod
     def create_baseline_model():
-        """Language model + plain (non-adaptive) fusion"""
-        return VisemePhonemeAdaptiveModel(model_type='baseline')
+        return ModelFactory.create('baseline')
 
     @staticmethod
     def create_visual_only_model():
-        """No language model"""
-        return VisemePhonemeAdaptiveModel(model_type='visual_only')
+        return ModelFactory.create('visual_only')
 
     @staticmethod
     def create_full_model():
-        """Full adaptive model"""
-        return VisemePhonemeAdaptiveModel(model_type='full')
+        return ModelFactory.create('full')
 
     @staticmethod
     def load_pretrained_model(checkpoint_path, model_type=None):
-        """Load a trained model.
-
-        The checkpoint's own model_type (saved by the trainer) is used so that evaluation runs the
-        same path that was trained; an explicit, different model_type only triggers a warning.
-        """
+        """Load a trained model with the architecture and input settings stored in the checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
         # The visual encoder's layer sizes depend on the frame size it was trained with
@@ -289,25 +273,20 @@ class ModelFactory:
             print(f"[load_pretrained_model] Using the checkpoint's frame size {saved_size[0]}x{saved_size[1]} "
                   f"(was {Config.FRAME_HEIGHT}x{Config.FRAME_WIDTH})")
             Config.FRAME_HEIGHT, Config.FRAME_WIDTH = saved_size
-        # Same input normalisation as in training
-        for key in ('PIXEL_MEAN', 'PIXEL_STD'):
+        for key in ('PIXEL_MEAN', 'PIXEL_STD'):  # same input normalisation as in training
             if key in saved_config:
                 setattr(Config, key, saved_config[key])
 
-        saved_type = checkpoint.get('model_type')
-        if saved_type and model_type and model_type != saved_type:
-            print(f"[load_pretrained_model] Checkpoint was trained as '{saved_type}'; "
+        model_config = dict(checkpoint.get('model_config') or {'model_type': checkpoint.get('model_type', 'full')})
+        if model_type and model_type != model_config.get('model_type'):
+            print(f"[load_pretrained_model] Checkpoint was trained as '{model_config.get('model_type')}'; "
                   f"ignoring requested model_type '{model_type}'.")
-        model = ModelFactory.create(saved_type or model_type or 'full')
+        model = ModelFactory.create(**model_config)
         model.known_speakers = list(checkpoint.get('known_speakers', []))
 
         state_dict = upgrade_legacy_state_dict(checkpoint['model_state_dict'])
-
-        # Load compatible weights only (older checkpoints may differ in architecture)
         model_dict = model.state_dict()
-        filtered_dict = {k: v for k, v in state_dict.items()
-                         if k in model_dict and v.shape == model_dict[k].shape}
-
+        filtered_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
         skipped = sorted(set(state_dict) - set(filtered_dict))
         missing = sorted(set(model_dict) - set(filtered_dict))
         if skipped or missing:
@@ -315,6 +294,5 @@ class ModelFactory:
                   f"{len(skipped)} checkpoint keys skipped (e.g. {skipped[:3]}), "
                   f"{len(missing)} model keys left at random init (e.g. {missing[:3]}). "
                   f"Results will not reflect the trained model; retrain with this code version.")
-
         model.load_state_dict(filtered_dict, strict=False)
         return model

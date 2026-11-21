@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from src.config import Config, detect_device
-from src.data_loader import prepare_frames
+from src.data_loader import frame_quality, meta_path_for, prepare_frames
 from models.fusion_network import ModelFactory
 
 
@@ -75,10 +75,23 @@ def collapse(labels):
     return [label for label in out if label not in ('sil', 'V11')]
 
 
-def predict(model, video, num_valid, speaker=None):
+def load_quality(path, num_valid):
+    """(1, T, Q) frame-quality signals from the matching .meta.npz, or None"""
+    meta_path = meta_path_for(path) if path.endswith('.npy') else None
+    if not meta_path or not os.path.exists(meta_path):
+        return None
+    with np.load(meta_path) as m:
+        quality, _ = frame_quality({k: m[k] for k in ('detected', 'transforms', 'size')}, num_valid)
+    padded = np.zeros((Config.SEQUENCE_LENGTH, quality.shape[1]), dtype=np.float32)
+    padded[:num_valid] = quality
+    return torch.from_numpy(padded).unsqueeze(0)
+
+
+def predict(model, video, num_valid, speaker=None, quality=None):
     device = next(model.parameters()).device
     speaker_ids = model.speaker_ids_for([speaker or 'unknown'], device)
-    preds = model.predict(video.to(device), speaker_ids=speaker_ids)
+    preds = model.predict(video.to(device), lengths=torch.tensor([num_valid], device=device),
+                          speaker_ids=speaker_ids, quality=None if quality is None else quality.to(device))
 
     phoneme_ids = preds['phoneme_predictions'][0, :num_valid].tolist()
     viseme_ids = preds['viseme_predictions'][0, :num_valid].tolist()
@@ -86,18 +99,21 @@ def predict(model, video, num_valid, speaker=None):
 
     phonemes = collapse([Config.PHONEMES[i] for i in phoneme_ids])
     visemes = collapse([f"V{i}" for i in viseme_ids])
-    return phonemes, visemes, confidence
+    return preds['greedy_text'][0], preds['constrained_text'][0], phonemes, visemes, confidence
 
 
 def test_prediction(model, input_path, speaker=None):
     video, num_valid = load_input(input_path)
     if video is None:
         return
-    phonemes, visemes, confidence = predict(model, video, num_valid, speaker)
+    greedy, constrained, phonemes, visemes, confidence = predict(model, video, num_valid, speaker,
+                                                                 load_quality(input_path, num_valid))
 
     print("\nPREDICTION RESULTS")
     print("=" * 50)
     print(f"Input: {os.path.basename(input_path)} ({num_valid} frames)")
+    print(f"Sentence (greedy):      {greedy}")
+    print(f"Sentence (GRID grammar): {constrained}")
     print(f"Phonemes: {' '.join(phonemes)}")
     print(f"Visemes:  {' '.join(visemes)}")
     print(f"Mean per-frame phoneme confidence: {confidence:.3f}")

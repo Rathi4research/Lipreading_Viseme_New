@@ -15,8 +15,17 @@ class VisualEncoder(nn.Module):
 
     def __init__(self, input_dim=None,
                  output_dim=None,
-                 input_channels=1):
+                 input_channels=1,
+                 pool=None):
         super(VisualEncoder, self).__init__()
+
+        # 'avg' (default): average the final feature map over its spatial grid, then project
+        #   (512 -> 1024 -> 512, about 1M parameters).
+        # 'flatten': flatten channels x H' x W' per frame before the projection (the original
+        #   design; about 13M parameters in the first projection at 88x88 input).
+        self.pool = pool or Config.VISUAL_POOL
+        if self.pool not in ('avg', 'flatten'):
+            raise ValueError(f"visual pool must be 'avg' or 'flatten', got {self.pool!r}")
 
         # Read Config at construction time (not import time) so runtime overrides such as
         # main.py --frame-size take effect.
@@ -52,7 +61,6 @@ class VisualEncoder(nn.Module):
         # therefore actually trained (previously it was created lazily on the first forward
         # pass and never reached the optimizer).
         self.frame_feature_size = self._calculate_frame_feature_size(self.input_dim)
-        print(f"[VisualEncoder] Per-frame conv feature size: {self.frame_feature_size}")
 
         # Per-frame projection
         self.fc1 = nn.Linear(self.frame_feature_size, 1024)
@@ -74,7 +82,7 @@ class VisualEncoder(nn.Module):
                 # 3 frames is enough: time is never pooled, so only H/W matter
                 dummy_input = torch.zeros(1, self.input_channels, 3, input_dim[0], input_dim[1])
                 _, c, _, h, w = self._conv_stack(dummy_input).shape
-                return c * h * w
+                return c if self.pool == 'avg' else c * h * w
         finally:
             self.train(original_training)
 
@@ -93,7 +101,10 @@ class VisualEncoder(nn.Module):
         x = self._conv_stack(x)
 
         b, c, t, h, w = x.shape
-        x = x.permute(0, 2, 1, 3, 4).contiguous().view(b * t, c * h * w)
+        if self.pool == 'avg':
+            x = x.mean(dim=(3, 4)).permute(0, 2, 1).reshape(b * t, c)
+        else:
+            x = x.permute(0, 2, 1, 3, 4).contiguous().view(b * t, c * h * w)
 
         x = self.dropout(F.relu(self.fc1(x)))
         features = self.fc2(x).view(b, t, -1)
@@ -143,10 +154,10 @@ class LipROI(nn.Module):
 class EnhancedVisualEncoder(nn.Module):
     """Visual encoder with lip ROI extraction"""
 
-    def __init__(self):
+    def __init__(self, pool=None):
         super(EnhancedVisualEncoder, self).__init__()
         self.lip_roi = LipROI()
-        self.visual_encoder = VisualEncoder()
+        self.visual_encoder = VisualEncoder(pool=pool)
 
     def forward(self, x):
         x = self.lip_roi(x)

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.config import Config
-from models.sequence_model import PositionalEncoding
+from models.sequence_model import PositionalEncoding, _run_lstm
 
 
 def time_match(x, target_len: int):
@@ -94,7 +94,7 @@ class GRIDLanguageModel(nn.Module):
                     self.word_to_type[Config.VOCABULARY.index(word)] = type_id
 
     def forward(self, input_features=None, word_indices=None,
-                sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
+                sequence_length=Config.SEQUENCE_LENGTH, batch_size=None, lengths=None, pad_mask=None):
         """
         Args:
             input_features: per-frame input features (B, T, embed_dim), or
@@ -115,10 +115,10 @@ class GRIDLanguageModel(nn.Module):
         positions = torch.arange(seq_len, device=embeds.device).clamp_max(self.max_len - 1)
         embeds = self.dropout(embeds + self.position_embedding(positions).unsqueeze(0))
 
-        lstm_out, _ = self.lstm(embeds)
-        lstm_out = self.dropout(lstm_out)
+        lstm_out = self.dropout(_run_lstm(self.lstm, embeds, lengths))
 
-        attended_out, _ = self.grammar_attention(lstm_out, lstm_out, lstm_out)
+        attended_out, _ = self.grammar_attention(lstm_out, lstm_out, lstm_out, key_padding_mask=pad_mask,
+                                                 need_weights=False)
         language_features = lstm_out + attended_out
 
         word_logits = self.output_projection(language_features)
@@ -169,12 +169,12 @@ class PhonemeLanguageModel(nn.Module):
             dropout=Config.DROPOUT_RATE,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3, enable_nested_tensor=False)
 
         self.output_projection = nn.Linear(embed_dim, num_phonemes)
 
     def forward(self, phoneme_probs=None, phoneme_indices=None,
-                sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
+                sequence_length=Config.SEQUENCE_LENGTH, batch_size=None, pad_mask=None):
         """
         Args:
             phoneme_probs: soft phoneme distribution per frame (B, T, num_phonemes) — in the full
@@ -197,7 +197,7 @@ class PhonemeLanguageModel(nn.Module):
         # PositionalEncoding expects (T, B, E)
         phoneme_embeds = self.pos_encoding(phoneme_embeds.transpose(0, 1)).transpose(0, 1)
 
-        phoneme_features = self.transformer(phoneme_embeds)
+        phoneme_features = self.transformer(phoneme_embeds, src_key_padding_mask=pad_mask)
         phoneme_logits = self.output_projection(phoneme_features)
         return phoneme_features, phoneme_logits
 
@@ -222,11 +222,12 @@ class HierarchicalLanguageModel(nn.Module):
 
         self.fc_out = nn.Linear(Config.HIDDEN_DIM * 2, vocab_size)
 
-    def forward(self, phoneme_probs=None, sequence_length=Config.SEQUENCE_LENGTH, batch_size=None):
+    def forward(self, phoneme_probs=None, sequence_length=Config.SEQUENCE_LENGTH, batch_size=None,
+                lengths=None, pad_mask=None):
         # Bottom-up: phoneme context first, then word context over the phoneme features
-        phoneme_features, _ = self.phoneme_lm(phoneme_probs=phoneme_probs,
-                                              sequence_length=sequence_length, batch_size=batch_size)
-        word_features, _ = self.word_lm(input_features=phoneme_features)
+        phoneme_features, _ = self.phoneme_lm(phoneme_probs=phoneme_probs, sequence_length=sequence_length,
+                                              batch_size=batch_size, pad_mask=pad_mask)
+        word_features, _ = self.word_lm(input_features=phoneme_features, lengths=lengths, pad_mask=pad_mask)
 
         phoneme_features = self.phoneme_proj(phoneme_features)
         target_len = max(word_features.size(1), phoneme_features.size(1))
@@ -236,7 +237,9 @@ class HierarchicalLanguageModel(nn.Module):
         attended_phonemes, _ = self.cross_attention(
             phoneme_features,  # query
             word_features,  # key
-            word_features  # value
+            word_features,  # value
+            key_padding_mask=pad_mask,
+            need_weights=False
         )
 
         combined_features = attended_phonemes + word_features
@@ -273,10 +276,11 @@ class ContextualLanguageModel(nn.Module):
 
         self.classifier = nn.Linear(Config.HIDDEN_DIM * 2, vocab_size)
 
-    def forward(self, phoneme_probs=None, speaker_ids=None, sequence_length=Config.SEQUENCE_LENGTH):
+    def forward(self, phoneme_probs=None, speaker_ids=None, sequence_length=Config.SEQUENCE_LENGTH,
+                lengths=None, pad_mask=None):
         batch_size = speaker_ids.size(0) if speaker_ids is not None else None
         base_features, _ = self.base_lm(phoneme_probs=phoneme_probs, sequence_length=sequence_length,
-                                        batch_size=batch_size)
+                                        batch_size=batch_size, lengths=lengths, pad_mask=pad_mask)
 
         if speaker_ids is not None:
             if self.training and self.speaker_dropout > 0:

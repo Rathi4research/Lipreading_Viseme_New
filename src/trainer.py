@@ -1,264 +1,147 @@
+import csv
+import json
+import logging
+import math
+import os
+import time
+
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-import csv
-import json
-import os
-import time
-import numpy as np
 from tqdm import tqdm
-import logging
+
 from src.config import Config
-
-from models.fusion_network import VisemePhonemeAdaptiveModel, ModelFactory
-from models.visual_encoder import upgrade_legacy_state_dict
 from src.data_loader import create_data_loaders
+from src.metrics import autocast_context, batch_to_device, run_evaluation
 from src.viseme_mapping import viseme_mapper
+from models.fusion_network import ModelFactory
+from models.visual_encoder import upgrade_legacy_state_dict
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SILENCE_VISEME = viseme_mapper.get_viseme('sil')
 
-
-class EarlyStopping:
-    """Early stopping to prevent overfitting"""
-
-    def __init__(self, patience=7, min_delta=0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = float('inf')
-        self.early_stop = False
-
-    def __call__(self, val_loss):
-        if val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-
-
-class AccuracyMeter:
-    """Frame-level viseme/phoneme accuracy over valid (non-padding) frames.
-
-    Also reports accuracy on speech frames only (target viseme != silence): silence is a large
-    share of every GRID clip and easy to predict, so all-frame accuracy alone overstates how well
-    speech is being read. Optional ground-truth ambiguity scores give a high/low ambiguity split
-    (analysis only — they are never fed to the model).
-    """
-
-    def __init__(self):
-        self.counts = {k: 0 for k in ('total', 'viseme', 'phoneme', 'speech_total', 'speech_viseme',
-                                      'speech_phoneme', 'high_total', 'high_phoneme', 'low_total',
-                                      'low_phoneme')}
-
-    def update(self, viseme_logits, phoneme_logits, visemes, phonemes, ambiguity_scores=None):
-        viseme_ok = torch.argmax(viseme_logits, dim=-1) == visemes
-        phoneme_ok = torch.argmax(phoneme_logits, dim=-1) == phonemes
-        valid = (visemes != -1) & (phonemes != -1)
-        speech = valid & (visemes != SILENCE_VISEME)
-
-        c = self.counts
-        c['total'] += valid.sum().item()
-        c['viseme'] += viseme_ok[valid].sum().item()
-        c['phoneme'] += phoneme_ok[valid].sum().item()
-        c['speech_total'] += speech.sum().item()
-        c['speech_viseme'] += viseme_ok[speech].sum().item()
-        c['speech_phoneme'] += phoneme_ok[speech].sum().item()
-        if ambiguity_scores is not None:
-            high = valid & (ambiguity_scores > Config.AMBIGUITY_THRESHOLD)
-            low = valid & (ambiguity_scores <= Config.AMBIGUITY_THRESHOLD)
-            c['high_total'] += high.sum().item()
-            c['high_phoneme'] += phoneme_ok[high].sum().item()
-            c['low_total'] += low.sum().item()
-            c['low_phoneme'] += phoneme_ok[low].sum().item()
-
-    @staticmethod
-    def _ratio(num, den):
-        return num / den if den > 0 else 0.0
-
-    def results(self):
-        c = self.counts
-        return {
-            'viseme_accuracy': self._ratio(c['viseme'], c['total']),
-            'phoneme_accuracy': self._ratio(c['phoneme'], c['total']),
-            'speech_viseme_accuracy': self._ratio(c['speech_viseme'], c['speech_total']),
-            'speech_phoneme_accuracy': self._ratio(c['speech_phoneme'], c['speech_total']),
-            'high_ambiguity_accuracy': self._ratio(c['high_phoneme'], c['high_total']),
-            'low_ambiguity_accuracy': self._ratio(c['low_phoneme'], c['low_total']),
-            'total_frames': c['total'],
-            'speech_frames': c['speech_total'],
-        }
+def cosine_with_warmup(total_steps, warmup_steps, min_ratio):
+    """LR multiplier: linear warmup to 1, then cosine decay to min_ratio."""
+    def schedule(step):
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+        return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+    return schedule
 
 
 class LipReadingTrainer:
-    """Training class for the viseme-phoneme adaptive model"""
+    """Training loop for the viseme-phoneme adaptive model.
 
-    LOSS_KEYS = ('total_loss', 'viseme_loss', 'aux_viseme_loss', 'phoneme_loss', 'word_loss', 'fusion_reg')
+    Model selection and early stopping use the validation greedy word error rate (ties broken by
+    the validation CTC loss). The final test evaluates the best checkpoint with greedy and
+    grammar-constrained decoding, homophene metrics and the fusion-gate analysis.
+    """
 
-    METRIC_FIELDS = [
-        'epoch', 'lr', 'epoch_seconds',
-        'train_total_loss', 'train_viseme_loss', 'train_aux_viseme_loss', 'train_phoneme_loss',
-        'train_word_loss', 'train_fusion_reg',
-        'val_total_loss', 'val_viseme_loss', 'val_aux_viseme_loss', 'val_phoneme_loss', 'val_word_loss',
-        'val_viseme_accuracy', 'val_phoneme_accuracy',
-        'val_speech_viseme_accuracy', 'val_speech_phoneme_accuracy',
-    ]
+    LOSS_KEYS = ('total_loss', 'ctc_loss', 'viseme_loss', 'aux_viseme_loss', 'phoneme_loss', 'word_loss', 'fusion_reg')
+    METRIC_FIELDS = (['epoch', 'lr', 'epoch_seconds'] + [f'train_{k}' for k in LOSS_KEYS] +
+                     [f'val_{k}' for k in LOSS_KEYS] +
+                     ['val_wer', 'val_cer', 'val_sentence_accuracy', 'val_viseme_accuracy', 'val_phoneme_accuracy',
+                      'val_speech_viseme_accuracy', 'val_speech_phoneme_accuracy', 'best'])
 
-    def __init__(self, model, train_loader, val_loader, test_loader=None, checkpoint_dir=None):
+    def __init__(self, model, train_loader, val_loader, test_loader=None, checkpoint_dir=None,
+                 num_epochs=Config.NUM_EPOCHS, run_info=None):
         self.model = model.to(Config.DEVICE)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
+        self.num_epochs = num_epochs
+        self.run_info = run_info or {}
 
         # Speakers seen in training; other speakers use the "unknown speaker" embedding
         self.model.known_speakers = list(getattr(train_loader.dataset, 'subjects', []))
 
-        # Where checkpoints, the per-epoch metrics CSV and the test results JSON are written.
-        # Defaults to Config.CHECKPOINT_DIR (Google Drive on Colab); main.py --local-checkpoints
-        # / --checkpoint-dir override it. Created up front so a bad path fails before training.
         self.checkpoint_dir = checkpoint_dir or Config.CHECKPOINT_DIR
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.metrics_path = os.path.join(self.checkpoint_dir, 'training_metrics.csv')
         self.test_results_path = os.path.join(self.checkpoint_dir, 'test_results.json')
         self.resumed = False
 
-        # Optimizer and scheduler
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=Config.LEARNING_RATE,
-            weight_decay=1e-5
-        )
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY)
+        total_steps = max(1, num_epochs * len(train_loader))
+        warmup = max(1, int(round(Config.WARMUP_RATIO * total_steps)))
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer, cosine_with_warmup(total_steps, warmup, Config.MIN_LR_RATIO))
 
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5,
-        )
+        self.use_amp = Config.AMP and str(Config.DEVICE).startswith('cuda')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
-        # Early stopping
-        self.early_stopping = EarlyStopping(patience=Config.PATIENCE)
+        self.writer = SummaryWriter(log_dir=f'runs/lipreading_{time.strftime("%Y%m%d_%H%M%S")}')
 
-        # Tensorboard writer
-        self.writer = SummaryWriter(log_dir=f'runs/lipreading_{self._get_timestamp()}')
-
-        # Training history
-        self.train_losses = []
-        self.val_losses = []
-        self.best_val_loss = float('inf')
+        self.train_losses, self.val_losses = [], []
+        self.best_key = (float('inf'), float('inf'))   # (val WER, val CTC loss)
+        self.epochs_without_improvement = 0
         self.epoch = 0
 
-        logger.info(f"Trainer initialized. Model type: {self.model.model_type}, "
-                    f"{self._count_parameters():,} trainable parameters, known speakers: {self.model.known_speakers}")
-        logger.info(f"Training on {len(train_loader)} batches, validating on {len(val_loader)} batches.")
+        n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info(f"Trainer initialized. Model: {self.model.model_config}, {n_params:,} trainable parameters, "
+                    f"known speakers: {self.model.known_speakers}")
+        logger.info(f"Training on {len(train_loader)} batches, validating on {len(val_loader)} batches; "
+                    f"device {Config.DEVICE}, mixed precision {'on' if self.use_amp else 'off'}; "
+                    f"AdamW lr {Config.LEARNING_RATE} (warmup {warmup} steps, cosine to {Config.MIN_LR_RATIO}x)")
         logger.info(f"Checkpoints and metrics will be written to: {os.path.abspath(self.checkpoint_dir)}")
 
-    def _get_timestamp(self):
-        """Get current timestamp for logging"""
-        from datetime import datetime
-        return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    def _count_parameters(self):
-        """Count trainable parameters in model"""
-        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-
-    def _run_batch(self, batch):
-        """Forward pass + losses for one batch. Only frames and speakers go into the model."""
-        frames = batch['frames'].to(Config.DEVICE)
-        targets = {
-            'visemes': batch['visemes'].to(Config.DEVICE),
-            'phonemes': batch['phonemes'].to(Config.DEVICE),
-            'words': batch['word_labels'].to(Config.DEVICE),
-        }
-        speaker_ids = self.model.speaker_ids_for(batch['subjects'], Config.DEVICE)
-
-        predictions = self.model(frames=frames, speaker_ids=speaker_ids)
-        losses = self.model.compute_loss(predictions, targets)
-        return predictions, targets, losses
-
-    def _evaluate_loader(self, loader, desc):
-        """Average losses and accuracy metrics over a loader (no grad)."""
-        self.model.eval()
-        epoch_losses = {k: [] for k in self.LOSS_KEYS}
-        meter = AccuracyMeter()
-
-        with torch.no_grad():
-            for batch in tqdm(loader, desc=desc):
-                predictions, targets, losses = self._run_batch(batch)
-                for key, value in losses.items():
-                    if key in epoch_losses:
-                        epoch_losses[key].append(value.item())
-                meter.update(predictions['viseme_logits'], predictions['phoneme_logits'],
-                             targets['visemes'], targets['phonemes'],
-                             batch['ambiguity_scores'].to(Config.DEVICE))
-
-        avg_losses = {key: float(np.mean(values)) for key, values in epoch_losses.items() if values}
-        return avg_losses, meter.results()
-
+    # ------------------------------------------------------------------ epochs
     def train_epoch(self):
-        """Train for one epoch"""
         self.model.train()
-        epoch_losses = {k: [] for k in self.LOSS_KEYS}
-
+        sums, n = {k: 0.0 for k in self.LOSS_KEYS}, 0
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.epoch + 1}")
-
         for batch_idx, batch in enumerate(progress_bar):
-            predictions, _, losses = self._run_batch(batch)
+            d = batch_to_device(batch, Config.DEVICE)
+            speaker_ids = self.model.speaker_ids_for(batch['subjects'], Config.DEVICE)
+            with autocast_context(Config.DEVICE, self.use_amp):
+                predictions = self.model(d['frames'], lengths=d['lengths'], speaker_ids=speaker_ids,
+                                         quality=d['quality'])
+                losses = self.model.compute_loss(predictions, d['targets'])
 
-            self.optimizer.zero_grad()
-            losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scaler.scale(losses['total_loss']).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=Config.GRAD_CLIP_NORM)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.scheduler.step()
 
-            for key, value in losses.items():
-                if key in epoch_losses:
-                    epoch_losses[key].append(value.item())
-
-            progress_bar.set_postfix({
-                'total_loss': f"{losses['total_loss'].item():.4f}",
-                'viseme_loss': f"{losses.get('viseme_loss', 0):.4f}",
-                'phoneme_loss': f"{losses.get('phoneme_loss', 0):.4f}"
-            })
-
-            # Log to tensorboard every 100 batches
+            for k, v in losses.items():
+                sums[k] += float(v)
+            n += 1
+            progress_bar.set_postfix({'loss': f"{float(losses['total_loss']):.3f}",
+                                      'ctc': f"{float(losses['ctc_loss']):.3f}",
+                                      'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"})
             if batch_idx % 100 == 0:
-                global_step = self.epoch * len(self.train_loader) + batch_idx
-                for key, value in losses.items():
-                    self.writer.add_scalar(f'Train/{key}', value.item(), global_step)
+                step = self.epoch * len(self.train_loader) + batch_idx
+                for k, v in losses.items():
+                    self.writer.add_scalar(f'Train/{k}', float(v), step)
+                self.writer.add_scalar('Train/lr', self.optimizer.param_groups[0]['lr'], step)
 
-                if predictions['fusion_weights'] is not None:
-                    fusion_weights = torch.stack(predictions['fusion_weights'], dim=-2).detach().cpu()
-                    self.writer.add_scalar('Train/avg_visual_weight', fusion_weights[..., 0].mean(), global_step)
-                    self.writer.add_scalar('Train/avg_language_weight', fusion_weights[..., 1].mean(), global_step)
-
-        avg_losses = {key: float(np.mean(values)) for key, values in epoch_losses.items() if values}
-        self.train_losses.append(avg_losses['total_loss'])
-        return avg_losses
+        avg = {k: v / max(n, 1) for k, v in sums.items() if v or k in ('total_loss', 'ctc_loss')}
+        self.train_losses.append(avg['total_loss'])
+        return avg
 
     def validate_epoch(self):
-        """Validate for one epoch"""
-        avg_losses, metrics = self._evaluate_loader(self.val_loader, "Validation")
-        self.val_losses.append(avg_losses['total_loss'])
+        result = run_evaluation(self.model, self.val_loader, Config.DEVICE, full=False, amp=self.use_amp,
+                                progress=lambda it: tqdm(it, desc="Validation"))
+        losses, frame, greedy = result['losses'], result['frame'], result['greedy']
+        self.val_losses.append(losses['total_loss'])
+        for k, v in losses.items():
+            self.writer.add_scalar(f'Val/{k}', v, self.epoch)
+        for k in ('wer', 'cer', 'sentence_accuracy'):
+            self.writer.add_scalar(f'Val/{k}', greedy[k], self.epoch)
+        logger.info(f"Validation - Loss: {losses['total_loss']:.4f} (ctc {losses['ctc_loss']:.4f}) | "
+                    f"WER {greedy['wer']:.4f}, CER {greedy['cer']:.4f}, sentence acc {greedy['sentence_accuracy']:.4f} | "
+                    f"speech-only Viseme Acc: {frame['speech_viseme_accuracy']:.4f}, "
+                    f"Phoneme Acc: {frame['speech_phoneme_accuracy']:.4f}")
+        return result
 
-        for key, value in avg_losses.items():
-            self.writer.add_scalar(f'Val/{key}', value, self.epoch)
-        for key in ('viseme_accuracy', 'phoneme_accuracy', 'speech_viseme_accuracy', 'speech_phoneme_accuracy'):
-            self.writer.add_scalar(f'Val/{key}', metrics[key], self.epoch)
-
-        logger.info(f"Validation - Loss: {avg_losses['total_loss']:.4f}, "
-                    f"Viseme Acc: {metrics['viseme_accuracy']:.4f}, Phoneme Acc: {metrics['phoneme_accuracy']:.4f} | "
-                    f"speech-only Viseme Acc: {metrics['speech_viseme_accuracy']:.4f}, "
-                    f"Phoneme Acc: {metrics['speech_phoneme_accuracy']:.4f}")
-
-        return avg_losses, metrics
-
+    # ------------------------------------------------------------------ loop
     def _write_metrics_row(self, row):
-        """Append one epoch's metrics to training_metrics.csv (header written on first row)."""
         write_header = not os.path.exists(self.metrics_path)
         with open(self.metrics_path, 'a', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=self.METRIC_FIELDS)
@@ -266,58 +149,50 @@ class LipReadingTrainer:
                 writer.writeheader()
             writer.writerow({k: row.get(k, '') for k in self.METRIC_FIELDS})
 
-    def train(self, num_epochs=Config.NUM_EPOCHS):
-        """Full training loop"""
-        # Fresh run: start a new metrics file. Resumed run: keep appending to the existing one.
+    def train(self, num_epochs=None):
+        num_epochs = num_epochs or self.num_epochs
         start_epoch = self.epoch + 1 if self.resumed else 0
         if not self.resumed and os.path.exists(self.metrics_path):
             os.remove(self.metrics_path)
-
         logger.info(f"Starting training for epochs {start_epoch + 1}..{num_epochs}")
 
         for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
-            epoch_start = time.time()
-
+            started = time.time()
             train_losses = self.train_epoch()
-            logger.info(f"Epoch {epoch + 1} - Training Loss: {train_losses['total_loss']:.4f}, "
-                        f"Viseme Loss: {train_losses.get('viseme_loss', float('nan')):.4f}, "
-                        f"Phoneme Loss: {train_losses.get('phoneme_loss', float('nan')):.4f}")
+            logger.info(f"Epoch {epoch + 1} - Training Loss: {train_losses['total_loss']:.4f} "
+                        f"(ctc {train_losses['ctc_loss']:.4f})")
+            val = self.validate_epoch()
 
-            val_losses, val_metrics = self.validate_epoch()
-
-            self.scheduler.step(val_losses['total_loss'])
-
+            key = (val['greedy']['wer'], val['losses']['ctc_loss'])
+            improved = key < self.best_key
             row = {'epoch': epoch + 1, 'lr': self.optimizer.param_groups[0]['lr'],
-                   'epoch_seconds': round(time.time() - epoch_start, 1)}
+                   'epoch_seconds': round(time.time() - started, 1), 'best': int(improved)}
             row.update({f'train_{k}': v for k, v in train_losses.items()})
-            row.update({f'val_{k}': v for k, v in val_losses.items()})
-            row.update({f'val_{k}': val_metrics[k] for k in ('viseme_accuracy', 'phoneme_accuracy',
+            row.update({f'val_{k}': v for k, v in val['losses'].items()})
+            row.update({'val_wer': val['greedy']['wer'], 'val_cer': val['greedy']['cer'],
+                        'val_sentence_accuracy': val['greedy']['sentence_accuracy']})
+            row.update({f'val_{k}': val['frame'][k] for k in ('viseme_accuracy', 'phoneme_accuracy',
                                                              'speech_viseme_accuracy', 'speech_phoneme_accuracy')})
             self._write_metrics_row(row)
 
-            # Save best model
-            if val_losses['total_loss'] < self.best_val_loss:
-                self.best_val_loss = val_losses['total_loss']
+            if improved:
+                self.best_key = key
+                self.epochs_without_improvement = 0
                 self.save_checkpoint('best_model.pth')
-                logger.info(f"New best model saved with validation loss: {self.best_val_loss:.4f}")
-
-            # Save regular checkpoint
+                logger.info(f"New best model saved: val WER {key[0]:.4f}, val CTC loss {key[1]:.4f}")
+            else:
+                self.epochs_without_improvement += 1
             if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pth')
-
-            # Always keep the latest state so an interrupted (e.g. Colab) session can resume
             self.save_checkpoint('last_model.pth')
 
-            self.early_stopping(val_losses['total_loss'])
-            if self.early_stopping.early_stop:
-                logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+            if self.epochs_without_improvement >= Config.PATIENCE:
+                logger.info(f"Early stopping at epoch {epoch + 1}: no validation improvement for {Config.PATIENCE} epochs")
                 break
 
         logger.info("Training completed!")
-
         if self.test_loader is not None:
-            # Test the best (lowest validation loss) model, not whatever the last epoch produced
             best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
             if os.path.exists(best_path):
                 best = torch.load(best_path, map_location=Config.DEVICE, weights_only=False)
@@ -325,99 +200,85 @@ class LipReadingTrainer:
                 self.epoch = best['epoch']
                 logger.info(f"Loaded best model (epoch {self.epoch + 1}) for test evaluation")
             self.evaluate()
-
         self.writer.close()
 
     def evaluate(self):
-        """Evaluate model on test set"""
-        logger.info("Evaluating on test set...")
-
-        avg_losses, metrics = self._evaluate_loader(self.test_loader, "Testing")
-
-        logger.info("=" * 50)
+        logger.info("Evaluating on test set (greedy + grammar-constrained decoding)...")
+        result = run_evaluation(self.model, self.test_loader, Config.DEVICE, full=True, amp=self.use_amp,
+                                progress=lambda it: tqdm(it, desc="Testing"))
+        g, c, f = result['greedy'], result['constrained'], result['frame']
+        logger.info("=" * 60)
         logger.info("TEST RESULTS")
-        logger.info("=" * 50)
-        logger.info(f"Test Loss: {avg_losses['total_loss']:.4f}")
-        logger.info(f"Viseme Accuracy: {metrics['viseme_accuracy']:.4f}")
-        logger.info(f"Phoneme Accuracy: {metrics['phoneme_accuracy']:.4f}")
-        logger.info(f"Speech-only Viseme Accuracy: {metrics['speech_viseme_accuracy']:.4f}")
-        logger.info(f"Speech-only Phoneme Accuracy: {metrics['speech_phoneme_accuracy']:.4f}")
-        logger.info(f"High Ambiguity Phoneme Accuracy: {metrics['high_ambiguity_accuracy']:.4f}")
-        logger.info(f"Low Ambiguity Phoneme Accuracy: {metrics['low_ambiguity_accuracy']:.4f}")
-        logger.info("=" * 50)
+        logger.info("=" * 60)
+        logger.info(f"Test Loss: {result['losses']['total_loss']:.4f} (ctc {result['losses']['ctc_loss']:.4f})")
+        logger.info(f"Greedy      WER {g['wer']:.4f}  CER {g['cer']:.4f}  sentence acc {g['sentence_accuracy']:.4f}")
+        logger.info(f"Constrained WER {c['wer']:.4f}  CER {c['cer']:.4f}  sentence acc {c['sentence_accuracy']:.4f}")
+        logger.info(f"Constrained letter slot: acc {c['letter_slot']['accuracy']:.4f}, homophene letters "
+                    f"{c['letter_slot']['homophene_letter_accuracy']:.4f}, within-group confusion "
+                    f"{c['letter_slot']['within_group_confusion_rate']:.4f}")
+        logger.info(f"Frame: viseme {f['viseme_accuracy']:.4f}, phoneme {f['phoneme_accuracy']:.4f}, speech-only "
+                    f"viseme {f['speech_viseme_accuracy']:.4f}, phoneme {f['speech_phoneme_accuracy']:.4f}")
+        if result['gate']:
+            logger.info("Gate (mean language weight): " + ", ".join(
+                f"{k} {v['mean_language_weight']:.3f} (n={v['frames']})" for k, v in result['gate'].items()))
+        logger.info("=" * 60)
 
-        test_results = {'test_loss': avg_losses['total_loss'], **metrics,
-                        'epoch': self.epoch + 1, 'model_type': self.model.model_type}
-        with open(self.test_results_path, 'w') as f:
-            json.dump(test_results, f, indent=2)
+        out = {k: v for k, v in result.items() if not k.startswith('_')}
+        out.update({'epoch': self.epoch + 1, 'model_config': self.model.model_config, 'run_info': self.run_info})
+        with open(self.test_results_path, 'w') as fh:
+            json.dump(out, fh, indent=2, default=float)
         logger.info(f"Test results written to {self.test_results_path}")
+        return out
 
-        return test_results
-
+    # ------------------------------------------------------------------ checkpoints
     @staticmethod
     def _config_snapshot():
-        """Plain-data copy of Config (picklable; skips methods/classmethods)."""
         simple = (str, int, float, bool, list, tuple, dict, type(None))
-        return {k: v for k, v in vars(Config).items()
-                if not k.startswith('__') and isinstance(v, simple)}
+        return {k: v for k, v in vars(Config).items() if not k.startswith('__') and isinstance(v, simple)}
 
     def save_checkpoint(self, filename):
-        """Save model checkpoint to self.checkpoint_dir"""
-        filepath = os.path.join(self.checkpoint_dir, filename)
-
-        checkpoint = {
+        torch.save({
             'epoch': self.epoch,
+            'model_config': self.model.model_config,
             'model_type': self.model.model_type,
             'known_speakers': self.model.known_speakers,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
+            'scaler_state_dict': self.scaler.state_dict(),
+            'best_key': self.best_key,
+            'epochs_without_improvement': self.epochs_without_improvement,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'config': self._config_snapshot()
-        }
-
-        torch.save(checkpoint, filepath)
+            'run_info': self.run_info,
+            'config': self._config_snapshot(),
+        }, os.path.join(self.checkpoint_dir, filename))
 
     def load_checkpoint(self, filepath):
-        """Load model checkpoint (to resume training)"""
-        # weights_only=False: our own checkpoints also hold optimizer/scheduler state and
-        # Python scalars/lists, which the PyTorch>=2.6 weights_only default rejects.
+        """Load a checkpoint to resume training"""
         checkpoint = torch.load(filepath, map_location=Config.DEVICE, weights_only=False)
-
-        saved_type = checkpoint.get('model_type')
-        if saved_type and saved_type != self.model.model_type:
-            raise ValueError(f"Checkpoint was trained as '{saved_type}' but the model is "
-                             f"'{self.model.model_type}'; pass --model-type {saved_type} to resume.")
-
+        saved = checkpoint.get('model_config')
+        if saved and saved != self.model.model_config:
+            raise ValueError(f"Checkpoint model {saved} differs from the requested model {self.model.model_config}; "
+                             f"pass the same --model-type/--seq-model/--visual-pool/--gate to resume.")
         self.model.load_state_dict(upgrade_legacy_state_dict(checkpoint['model_state_dict']))
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
+        if 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.epoch = checkpoint['epoch']
-        self.best_val_loss = checkpoint['best_val_loss']
+        self.best_key = tuple(checkpoint.get('best_key', self.best_key))
+        self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
         self.resumed = True
-
-        logger.info(f"Checkpoint loaded from epoch {self.epoch + 1}")
+        logger.info(f"Checkpoint loaded from epoch {self.epoch + 1} (best val WER so far {self.best_key[0]:.4f})")
 
 
 def main():
-    """Main training function"""
-    train_loader, val_loader, test_loader = create_data_loaders(
-        train_subjects=['s1'],
-        val_subjects=['s2'],
-        test_subjects=['s3']
-    )
-
-    model = ModelFactory.create_full_model()
-    trainer = LipReadingTrainer(model, train_loader, val_loader, test_loader)
-
-    logger.info("Viseme mappings:")
+    train_loader, val_loader, test_loader = create_data_loaders(['s1'], ['s2'], ['s3'])
+    trainer = LipReadingTrainer(ModelFactory.create_full_model(), train_loader, val_loader, test_loader)
     viseme_mapper.print_mappings()
-
     trainer.train()
 
 

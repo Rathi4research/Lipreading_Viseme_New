@@ -7,12 +7,15 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from src.config import Config, detect_device
 import logging
+import random
+import subprocess
 import numpy as np
 import torch
 
 import sys
 import argparse
-from src.data_loader import create_data_loaders
+from src.data_loader import GRIDDataset, create_data_loaders, make_loader
+from src.decoding import word_errors
 from src.trainer import LipReadingTrainer
 from src.evaluator import LipReadingEvaluator
 from src.viseme_mapping import viseme_mapper
@@ -90,13 +93,36 @@ def resolve_checkpoint_dir(args):
     return checkpoint_dir
 
 
+def run_info(args):
+    """Code version and command-line settings, stored in checkpoints and test results."""
+    info = {'args': {k: v for k, v in vars(args).items()}}
+    try:
+        info['commit'] = subprocess.run(['git', 'rev-parse', 'HEAD'], capture_output=True, text=True,
+                                        check=True, cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip()
+        dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], capture_output=True,
+                               text=True, cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip()
+        info['dirty'] = bool(dirty)
+    except (OSError, subprocess.CalledProcessError):
+        info['commit'] = None
+    return info
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def build_model(args):
+    return ModelFactory.create(args.model_type or 'full', seq_model=args.seq_model, visual_pool=args.visual_pool,
+                               gate=args.gate)
+
+
 def train_model(args):
     """Train the model"""
     logger.info("Starting model training...")
-
     checkpoint_dir = resolve_checkpoint_dir(args)
 
-    # Create data loaders
     train_loader, val_loader, test_loader = create_data_loaders(
         train_subjects=args.train_subjects,
         val_subjects=args.val_subjects,
@@ -104,148 +130,82 @@ def train_model(args):
         max_samples_per_subject=args.max_samples_per_subject
     )
 
-    # Create model (same model_type is used for training and, via the checkpoint, evaluation)
-    model = ModelFactory.create(args.model_type or 'full')
-
+    # The model configuration is stored in the checkpoint and reused by evaluate/inference
+    model = build_model(args)
     print_model_info(model)
 
-    # Print viseme mappings
-    logger.info("Viseme-Phoneme Mappings:")
-    viseme_mapper.print_mappings()
-
-    # Create trainer
-    trainer = LipReadingTrainer(model, train_loader, val_loader, test_loader,
-                                checkpoint_dir=checkpoint_dir)
-
-    # Load checkpoint if specified
+    trainer = LipReadingTrainer(model, train_loader, val_loader, test_loader, checkpoint_dir=checkpoint_dir,
+                                num_epochs=args.num_epochs, run_info=run_info(args))
     if args.resume_from:
         trainer.load_checkpoint(args.resume_from)
         logger.info(f"Resumed training from {args.resume_from}")
 
-    # Start training
     trainer.train(num_epochs=args.num_epochs)
-
     logger.info("Training completed!")
 
 
 def evaluate_model(args):
-    """Evaluate the model"""
+    """Evaluate a checkpoint on the test speakers (optionally with controlled frame corruption)."""
     logger.info("Starting model evaluation...")
-
-    # Create test data loader
-    _, _, test_loader = create_data_loaders(test_subjects=args.test_subjects,
-                                            max_samples_per_subject=args.max_samples_per_subject)
-
-    # Load model
-    if args.checkpoint_path:
-        model = ModelFactory.load_pretrained_model(args.checkpoint_path, args.model_type)
-        logger.info(f"Loaded model from {args.checkpoint_path}")
-    else:
+    if not args.checkpoint_path:
         logger.error("No checkpoint path provided for evaluation")
         return
+    model = ModelFactory.load_pretrained_model(args.checkpoint_path, args.model_type)
+    logger.info(f"Loaded model {model.model_config} from {args.checkpoint_path}")
 
-    # Create evaluator
-    evaluator = LipReadingEvaluator(model, test_loader, device=Config.DEVICE)
+    test_set = GRIDDataset(Config.DATA_DIR, subjects=args.test_subjects,
+                           max_samples_per_subject=args.max_samples_per_subject, corrupt_ratio=args.corrupt_ratio)
+    if args.corrupt_ratio:
+        logger.info(f"Controlled corruption: about {args.corrupt_ratio:.0%} of each clip's frames replaced and flagged")
+    evaluator = LipReadingEvaluator(model, make_loader(test_set, shuffle=False), device=Config.DEVICE)
+    evaluator.evaluate_comprehensive()
 
-    # Run comprehensive evaluation
-    results = evaluator.evaluate_comprehensive()
-
-    # Generate plots
-    if 'confusion_matrices' in results:
-        # Plot viseme confusion matrix (labels show the phonemes in each viseme class)
-        viseme_labels = [f"V{i} " + "/".join(p for p in viseme_mapper.viseme_to_phonemes[i] if p in Config.PHONEMES)[:12]
-                         for i in range(viseme_mapper.num_visemes)]
-        evaluator.plot_confusion_matrix(
-            results['confusion_matrices']['viseme_confusion_matrix'],
-            viseme_labels,
-            "Viseme Confusion Matrix",
-            "plots/viseme_confusion_matrix.png"
-        )
-
-        # Plot phoneme confusion matrix restricted to phonemes that occur in the test set
-        phoneme_cm = results['confusion_matrices']['phoneme_confusion_matrix']
-        present = [i for i in range(phoneme_cm.shape[0]) if phoneme_cm[i].sum() > 0]
-        evaluator.plot_confusion_matrix(
-            phoneme_cm[np.ix_(present, present)],
-            [Config.PHONEMES[i] for i in present],
-            "Phoneme Confusion Matrix (phonemes present in test set)",
-            "plots/phoneme_confusion_matrix.png",
-            figsize=(max(12, len(present) * 0.45), max(10, len(present) * 0.4))
-        )
-
-
-
-    # Plot fusion analysis
-    if 'fusion_analysis' in results:
-        evaluator.plot_fusion_analysis(
-            results['fusion_analysis'],
-            "plots/fusion_analysis.png"
-        )
-
-    # Generate report
-    evaluator.generate_report("results/evaluation_report.txt")
-
+    suffix = f"_corrupt{args.corrupt_ratio:g}" if args.corrupt_ratio else ""
+    out_dir = args.results_dir
+    evaluator.save_plots(os.path.join(out_dir, 'plots'))
+    evaluator.save_json(os.path.join(out_dir, f'evaluation_results{suffix}.json'),
+                        extra={'checkpoint': args.checkpoint_path, 'test_subjects': args.test_subjects,
+                               'corrupt_ratio': args.corrupt_ratio})
+    evaluator.generate_report(os.path.join(out_dir, f'evaluation_report{suffix}.txt'))
     logger.info("Evaluation completed!")
 
 
 def inference_demo(args):
-    """Run inference demo: per-utterance predictions vs targets for a few test samples"""
+    """Inference demo: decoded sentences vs references for a few test utterances"""
     logger.info("Running inference demo...")
-
     if not args.checkpoint_path:
         logger.error("No checkpoint path provided for inference")
         return
-    model = ModelFactory.load_pretrained_model(args.checkpoint_path, args.model_type)
-    logger.info(f"Loaded '{model.model_type}' model from {args.checkpoint_path}")
+    model = ModelFactory.load_pretrained_model(args.checkpoint_path, args.model_type).to(Config.DEVICE)
+    logger.info(f"Loaded model {model.model_config} from {args.checkpoint_path}")
 
     _, _, test_loader = create_data_loaders(test_subjects=args.test_subjects,
                                             max_samples_per_subject=args.max_samples_per_subject)
-
-    model = model.to(Config.DEVICE)
-    model.eval()
     shown = 0
-    with torch.no_grad():
-        for batch in test_loader:
+    for batch in test_loader:
+        if shown >= args.demo_samples:
+            break
+        speaker_ids = model.speaker_ids_for(batch['subjects'], Config.DEVICE)
+        p = model.predict(batch['frames'].to(Config.DEVICE), lengths=batch['lengths'].to(Config.DEVICE),
+                          speaker_ids=speaker_ids, quality=batch['quality'].to(Config.DEVICE))
+        fw = None if p['fusion_weights'] is None else torch.stack(p['fusion_weights']).mean(0)
+        for i in range(batch['frames'].size(0)):
             if shown >= args.demo_samples:
                 break
-
-            frames = batch['frames'].to(Config.DEVICE)
-            visemes = batch['visemes']
-            phonemes = batch['phonemes']
-            speaker_ids = model.speaker_ids_for(batch['subjects'], Config.DEVICE)
-
-            predictions = model.predict(frames, speaker_ids=speaker_ids)
-            fusion_weights = predictions['fusion_weights']
-            if fusion_weights is not None:
-                fusion_weights = torch.stack(fusion_weights, dim=0).mean(dim=0)  # avg over scales -> (B, T, 2)
-
-            for i in range(frames.size(0)):
-                if shown >= args.demo_samples:
-                    break
-                shown += 1
-
-                valid = phonemes[i] != -1
-                v_pred = predictions['viseme_predictions'][i].cpu()[valid].tolist()
-                p_pred = predictions['phoneme_predictions'][i].cpu()[valid].tolist()
-                v_true = visemes[i][valid].tolist()
-                p_true = phonemes[i][valid].tolist()
-                ambiguity = predictions['ambiguity_scores'][i].cpu()[valid].tolist()
-
-                logger.info(f"\n{'=' * 50}")
-                logger.info(f"DEMO SAMPLE {shown}: subject {batch['subjects'][i]}, utterance {batch['utterance_ids'][i]}")
-                logger.info(f"Words: {' '.join(batch['words'][i])}")
-                logger.info(f"{'=' * 50}")
-                logger.info(f"Frames: {len(v_true)}")
-                logger.info(f"Viseme Accuracy: {sum(p == t for p, t in zip(v_pred, v_true)) / len(v_true):.4f}")
-                logger.info(f"Phoneme Accuracy: {sum(p == t for p, t in zip(p_pred, p_true)) / len(p_true):.4f}")
-                logger.info(f"Average (predicted) Ambiguity: {sum(ambiguity) / len(ambiguity):.4f}")
-                logger.info(f"Predicted phonemes: {collapse_phonemes(p_pred)}")
-                logger.info(f"Target phonemes:    {collapse_phonemes(p_true)}")
-
-                if fusion_weights is not None:
-                    fw = fusion_weights[i].cpu()[valid]
-                    logger.info(f"Fusion Weights - Visual: {fw[:, 0].mean():.4f}, Language: {fw[:, 1].mean():.4f}")
-
+            shown += 1
+            ref = batch['sentences'][i]
+            valid = batch['phonemes'][i] != -1
+            logger.info(f"\n{'=' * 50}")
+            logger.info(f"DEMO SAMPLE {shown}: subject {batch['subjects'][i]}, utterance {batch['utterance_ids'][i]}")
+            logger.info(f"Reference:   {ref}")
+            logger.info(f"Greedy:      {p['greedy_text'][i]}   (word errors {word_errors(ref, p['greedy_text'][i])[0]}/6)")
+            logger.info(f"Constrained: {p['constrained_text'][i]}   (word errors {word_errors(ref, p['constrained_text'][i])[0]}/6)")
+            p_pred = p['phoneme_predictions'][i].cpu()[valid].tolist()
+            logger.info(f"Frame phonemes (pred):   {collapse_phonemes(p_pred)}")
+            logger.info(f"Frame phonemes (target): {collapse_phonemes(batch['phonemes'][i][valid].tolist())}")
+            if fw is not None:
+                w = fw[i].cpu()[valid]
+                logger.info(f"Fusion Weights - Visual: {w[:, 0].mean():.4f}, Language: {w[:, 1].mean():.4f}")
     logger.info("Inference demo completed!")
 
 
@@ -338,6 +298,13 @@ def create_sample_data(num_utterances=6, subjects=('s1', 's2', 's3')):
             size = Config.PREPROCESS_SIZE
             frames = rng.integers(0, 256, (num_frames, size, size), dtype=np.uint8)
             np.save(os.path.join(npy_dir, utterance_id + '.npy'), frames)
+            # metadata like scripts/preprocess.py writes: a few missed detections and slight crop drift
+            detected = np.ones(num_frames, dtype=bool)
+            detected[rng.integers(0, num_frames, size=3)] = False
+            transforms = np.tile(np.array([[1.0, 0, 0], [0, 1.0, 0]], dtype=np.float32), (num_frames, 1, 1))
+            transforms[:, :, 2] = np.cumsum(rng.normal(0, 0.5, (num_frames, 2)), axis=0)
+            np.savez_compressed(os.path.join(npy_dir, utterance_id + '.meta.npz'), detected=detected,
+                                transforms=transforms, size=np.array(size), crop_mode=np.array('synthetic'))
 
     logger.info(f"Synthetic data created for {list(subjects)} ({num_utterances} utterances each).")
 
@@ -351,6 +318,12 @@ def main():
                         help='Operation mode')
 
     # Model configuration
+    parser.add_argument('--seq-model', choices=['bilstm', 'transformer', 'hybrid', 'conformer'],
+                        default=Config.SEQ_MODEL, help='Temporal sequence encoder (training)')
+    parser.add_argument('--visual-pool', choices=['avg', 'flatten'], default=Config.VISUAL_POOL,
+                        help='Spatial pooling at the end of the 3D CNN (training)')
+    parser.add_argument('--gate', choices=['ambiguity', 'entropy', 'learned', 'hard', 'intrinsic-extrinsic'],
+                        default=Config.GATE, help='Fusion gate for --model-type full (training)')
     parser.add_argument('--model-type', choices=['full', 'baseline', 'visual_only'],
                         default=None,
                         help="Model variant for training (default: full). For evaluate/inference "
@@ -373,8 +346,17 @@ def main():
                         help='Batch size')
     parser.add_argument('--learning-rate', type=float, default=Config.LEARNING_RATE,
                         help='Learning rate')
-    parser.add_argument('--num-workers', type=int, default=Config.NUM_WORKERS,
-                        help='DataLoader worker processes (0 = load in the main process)')
+    parser.add_argument('--num-workers', type=int, default=None,
+                        help='DataLoader worker processes (default: 2 on CUDA, 0 otherwise)')
+    parser.add_argument('--seed', type=int, default=Config.SEED, help='Random seed')
+    parser.add_argument('--no-amp', action='store_true', help='Disable mixed precision on CUDA')
+    parser.add_argument('--min-detected-ratio', type=float, default=Config.MIN_DETECTED_RATIO,
+                        help='Skip clips with a face detected in fewer than this share of frames')
+    parser.add_argument('--corrupt-ratio', type=float, default=0.0,
+                        help='evaluate: replace about this share of each test clip\'s frames and flag them '
+                             '(controlled robustness test)')
+    parser.add_argument('--results-dir', type=str, default='results',
+                        help='evaluate: folder for the report, JSON and plots')
 
     # Checkpoint location
     ckpt_group = parser.add_mutually_exclusive_group()
@@ -419,7 +401,10 @@ def main():
     # Update config with command line arguments (must happen before any model/dataset is built)
     Config.BATCH_SIZE = args.batch_size
     Config.LEARNING_RATE = args.learning_rate
-    Config.NUM_WORKERS = args.num_workers
+    Config.NUM_WORKERS = args.num_workers if args.num_workers is not None else (2 if device.startswith('cuda') else 0)
+    Config.MIN_DETECTED_RATIO = args.min_detected_ratio
+    Config.AMP = not args.no_amp
+    set_seed(args.seed)
     Config.set_data_dir(args.data_dir)
     if args.frame_size:
         Config.FRAME_WIDTH = Config.FRAME_HEIGHT = args.frame_size
