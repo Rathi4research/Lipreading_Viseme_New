@@ -35,8 +35,10 @@ def cosine_with_warmup(total_steps, warmup_steps, min_ratio):
 class LipReadingTrainer:
     """Training loop for the viseme-phoneme adaptive model.
 
-    Model selection and early stopping use the validation greedy word error rate (ties broken by
-    the validation CTC loss). The final test evaluates the best checkpoint with greedy and
+    Model selection and early stopping use a validation metric (Config.SELECT_METRIC): 'cer' (default)
+    = greedy character error rate, then WER, then CTC loss; 'wer' = greedy word error rate, then CER,
+    then CTC loss. CER is the default because WER stays near 1.0 for the first epochs (a word counts
+    only when all its characters are right), which made the WER-selected checkpoint arbitrary. The final test evaluates the best checkpoint with greedy and
     grammar-constrained decoding, homophene metrics and the fusion-gate analysis.
     """
 
@@ -76,7 +78,7 @@ class LipReadingTrainer:
         self.writer = SummaryWriter(log_dir=f'runs/lipreading_{time.strftime("%Y%m%d_%H%M%S")}')
 
         self.train_losses, self.val_losses = [], []
-        self.best_key = (float('inf'), float('inf'))   # (val WER, val CTC loss)
+        self.best_key = (float('inf'),) * 3   # see _selection_key
         self.epochs_without_improvement = 0
         self.epoch = 0
 
@@ -140,6 +142,11 @@ class LipReadingTrainer:
                     f"Phoneme Acc: {frame['speech_phoneme_accuracy']:.4f}")
         return result
 
+    @staticmethod
+    def _selection_key(val):
+        g, ctc = val['greedy'], val['losses']['ctc_loss']
+        return (g['cer'], g['wer'], ctc) if Config.SELECT_METRIC == 'cer' else (g['wer'], g['cer'], ctc)
+
     # ------------------------------------------------------------------ loop
     def _write_metrics_row(self, row):
         write_header = not os.path.exists(self.metrics_path)
@@ -164,7 +171,7 @@ class LipReadingTrainer:
                         f"(ctc {train_losses['ctc_loss']:.4f})")
             val = self.validate_epoch()
 
-            key = (val['greedy']['wer'], val['losses']['ctc_loss'])
+            key = self._selection_key(val)
             improved = key < self.best_key
             row = {'epoch': epoch + 1, 'lr': self.optimizer.param_groups[0]['lr'],
                    'epoch_seconds': round(time.time() - started, 1), 'best': int(improved)}
@@ -180,7 +187,8 @@ class LipReadingTrainer:
                 self.best_key = key
                 self.epochs_without_improvement = 0
                 self.save_checkpoint('best_model.pth')
-                logger.info(f"New best model saved: val WER {key[0]:.4f}, val CTC loss {key[1]:.4f}")
+                logger.info(f"New best model saved ({Config.SELECT_METRIC}): val CER {val['greedy']['cer']:.4f}, "
+                            f"WER {val['greedy']['wer']:.4f}, CTC loss {val['losses']['ctc_loss']:.4f}")
             else:
                 self.epochs_without_improvement += 1
             if (epoch + 1) % 5 == 0:
@@ -247,6 +255,7 @@ class LipReadingTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'best_key': self.best_key,
+            'select_metric': Config.SELECT_METRIC,
             'epochs_without_improvement': self.epochs_without_improvement,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
@@ -267,12 +276,14 @@ class LipReadingTrainer:
         if 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.epoch = checkpoint['epoch']
-        self.best_key = tuple(checkpoint.get('best_key', self.best_key))
+        saved_key = tuple(checkpoint.get('best_key', ()))
+        self.best_key = saved_key if len(saved_key) == 3 and checkpoint.get('select_metric') == Config.SELECT_METRIC \
+            else (float('inf'),) * 3
         self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
         self.resumed = True
-        logger.info(f"Checkpoint loaded from epoch {self.epoch + 1} (best val WER so far {self.best_key[0]:.4f})")
+        logger.info(f"Checkpoint loaded from epoch {self.epoch + 1} (selection metric {Config.SELECT_METRIC})")
 
 
 def main():

@@ -141,7 +141,7 @@ letter-slot homophene groups derived from `viseme_mapper`, b/p d/t m/n confusion
 (mean language weight by ambiguous × unreliable frame type).
 
 `src/trainer.py`: AdamW + linear warmup + cosine decay (per step), mixed precision on CUDA, gradient
-clipping; model selection and early stopping on validation greedy WER (tie-break val CTC loss); writes
+clipping; model selection and early stopping on validation greedy CER by default (`--select-metric cer|wer`); writes
 `training_metrics.csv`, `best_model.pth`, `last_model.pth`, `test_results.json` (best checkpoint, full
 metrics, commit and arguments). `src/evaluator.py` (`main.py evaluate`): report, JSON and confusion plots.
 

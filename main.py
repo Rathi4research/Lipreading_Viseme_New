@@ -349,6 +349,8 @@ def main():
     parser.add_argument('--num-workers', type=int, default=None,
                         help='DataLoader worker processes (default: 2 on CUDA, 0 otherwise)')
     parser.add_argument('--seed', type=int, default=Config.SEED, help='Random seed')
+    parser.add_argument('--select-metric', choices=['cer', 'wer'], default=Config.SELECT_METRIC,
+                        help='Validation metric for the best checkpoint and early stopping')
     parser.add_argument('--no-amp', action='store_true', help='Disable mixed precision on CUDA')
     parser.add_argument('--min-detected-ratio', type=float, default=Config.MIN_DETECTED_RATIO,
                         help='Skip clips with a face detected in fewer than this share of frames')
@@ -404,6 +406,7 @@ def main():
     Config.NUM_WORKERS = args.num_workers if args.num_workers is not None else (2 if device.startswith('cuda') else 0)
     Config.MIN_DETECTED_RATIO = args.min_detected_ratio
     Config.AMP = not args.no_amp
+    Config.SELECT_METRIC = args.select_metric
     set_seed(args.seed)
     Config.set_data_dir(args.data_dir)
     if args.frame_size:

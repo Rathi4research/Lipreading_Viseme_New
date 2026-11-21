@@ -68,6 +68,7 @@ class Config:
     GRAD_CLIP_NORM = 1.0
     NUM_EPOCHS = 100
     PATIENCE = 10                   # early stopping on the validation selection metric
+    SELECT_METRIC = 'cer'           # best checkpoint / early stopping: 'cer' (greedy CER) or 'wer'
     NUM_WORKERS = 0                 # DataLoader workers (main.py: 2 on CUDA by default)
     AMP = True                      # mixed precision; only takes effect on CUDA
     SEED = 42
