@@ -134,8 +134,8 @@ Loss (`compute_loss`, weights in `Config.LOSS_WEIGHTS`): CTC + viseme + aux vise
 (not for visual_only) + gate-entropy regulariser (soft gates). Per-frame terms skip padding and frames
 without a detected face and down-weight silence (`Config.SILENCE_LOSS_WEIGHT`). CTC runs on CPU under MPS.
 
-`src/decoding.py`: greedy CTC decoding, GRID-grammar-constrained prefix beam search
-(`Config.BEAM_SIZE`), WER/CER. `src/metrics.py`: `run_evaluation` (shared by trainer and evaluator),
+`src/decoding.py`: greedy CTC decoding, exact best-path (Viterbi) decoding over the GRID grammar's
+CTC graph (always a complete 6-word sentence), WER/CER. `src/metrics.py`: `run_evaluation` (shared by trainer and evaluator),
 frame metrics (incl. phoneme accuracy within each viseme class), sentence metrics (per-slot accuracy,
 letter-slot homophene groups derived from `viseme_mapper`, b/p d/t m/n confusions) and the gate analysis
 (mean language weight by ambiguous × unreliable frame type).

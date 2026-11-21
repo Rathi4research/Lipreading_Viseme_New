@@ -80,7 +80,7 @@ class Config:
     # Sentence-level CTC over characters (blank = index 0)
     CTC_CHARS = " abcdefghijklmnopqrstuvwxyz"
     CTC_BLANK = 0
-    BEAM_SIZE = 16                  # grammar-constrained CTC prefix beam search
+    BEAM_SIZE = 16                  # unused: grammar-constrained decoding is an exact Viterbi search
 
     # Loss weights. CTC is the main objective; the per-frame terms are auxiliary.
     LOSS_WEIGHTS = {

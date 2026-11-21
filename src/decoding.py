@@ -3,8 +3,6 @@ and word / character error rates.
 
 Output alphabet (Config.CTC_CHARS): index 0 is the CTC blank, then space and a-z.
 """
-import math
-
 import numpy as np
 
 from src.config import Config
@@ -82,54 +80,88 @@ class _GridGrammar:
 _GRAMMAR = _GridGrammar()
 
 
-def _logsumexp(*xs):
-    m = max(xs)
-    if m == -math.inf:
-        return -math.inf
-    return m + math.log(sum(math.exp(x - m) for x in xs))
+class _GridCTCGraph:
+    """CTC topology of the GRID grammar, for best-path (Viterbi) decoding.
+
+    Each slot word is spelled as its characters (words after the first are prefixed with a space);
+    every character has an emitting state and a following blank state, plus one leading blank.
+    Transitions follow CTC rules: stay, move to the next character (directly unless it repeats the
+    previous one), or pass through a blank; the first character of a word in slot k is reachable from
+    the end (last character or its blank) of any word in slot k-1.
+    """
+
+    def __init__(self):
+        labels, slot_word, preds = [BLANK], [(-1, None)], [[0]]   # state 0 = leading blank
+        ends_prev = None
+        start_states = [0]
+        for slot, vocab in enumerate(GRID_SLOTS):
+            ends = []
+            for word in vocab:
+                token = word if slot == 0 else ' ' + word
+                prev_emit = prev_blank = None
+                for i, ch in enumerate(token):
+                    emit = len(labels)
+                    labels.append(CHAR_TO_INDEX[ch]); slot_word.append((slot, word))
+                    if i == 0:
+                        p = [emit] + ([0] if slot == 0 else ends_prev)
+                        if slot == 0:
+                            start_states.append(emit)
+                    else:
+                        p = [emit, prev_blank] + ([prev_emit] if ch != token[i - 1] else [])
+                    preds.append(p)
+                    blank = len(labels)
+                    labels.append(BLANK); slot_word.append((slot, word)); preds.append([blank, emit])
+                    prev_emit, prev_blank = emit, blank
+                ends += [prev_emit, prev_blank]
+            ends_prev = ends
+        self.labels = np.array(labels)
+        self.slot_word = slot_word
+        self.final_states = np.array(ends_prev)
+        self.start_states = np.array(start_states)
+        width = max(len(p) for p in preds)
+        self.pred = np.array([p + [p[0]] * (width - len(p)) for p in preds])  # pad with a duplicate
+
+
+_GRAPH = None
 
 
 def constrained_decode(log_probs, length=None, beam_size=None):
-    """CTC prefix beam search restricted to grammatical GRID sentences.
+    """Best CTC path restricted to grammatical GRID sentences (Viterbi over the grammar graph).
 
-    Every hypothesis is kept a prefix of some valid "command colour preposition letter digit
-    adverb" sentence, so the result is always six in-vocabulary words when any complete
-    hypothesis survives (otherwise the best partial hypothesis is returned).
+    Always returns a complete "command colour preposition letter digit adverb" sentence when the clip
+    has enough frames; otherwise falls back to greedy decoding. beam_size is accepted for backward
+    compatibility and ignored (the search is exact).
     """
-    beam_size = beam_size or Config.BEAM_SIZE
+    global _GRAPH
+    if _GRAPH is None:
+        _GRAPH = _GridCTCGraph()
+    g = _GRAPH
     lp = np.asarray(log_probs, dtype=np.float64)
     if length is not None:
         lp = lp[:length]
-    neg_inf = -math.inf
-    # prefix -> (log p ending in blank, log p ending in non-blank)
-    beams = {'': (0.0, neg_inf)}
-    for t in range(lp.shape[0]):
-        frame = lp[t]
-        next_beams = {}
-
-        def add(prefix, pb, pnb):
-            ob, onb = next_beams.get(prefix, (neg_inf, neg_inf))
-            next_beams[prefix] = (_logsumexp(ob, pb), _logsumexp(onb, pnb))
-
-        for prefix, (pb, pnb) in beams.items():
-            total = _logsumexp(pb, pnb)
-            # stay: blank, or repeat of the last character without a blank in between
-            add(prefix, total + frame[BLANK], neg_inf)
-            if prefix:
-                add(prefix, neg_inf, pnb + frame[CHAR_TO_INDEX[prefix[-1]]])
-            for c in _GRAMMAR.allowed(prefix):
-                ci = CHAR_TO_INDEX[c]
-                if prefix and c == prefix[-1]:
-                    add(prefix + c, neg_inf, pb + frame[ci])     # repeat needs a blank between
-                else:
-                    add(prefix + c, neg_inf, total + frame[ci])
-        beams = dict(sorted(next_beams.items(), key=lambda kv: _logsumexp(*kv[1]), reverse=True)[:beam_size])
-
-    ranked = sorted(beams.items(), key=lambda kv: _logsumexp(*kv[1]), reverse=True)
-    for prefix, _ in ranked:
-        if _GRAMMAR.complete(prefix):
-            return prefix
-    return ranked[0][0] if ranked else ''
+    T = lp.shape[0]
+    if T == 0:
+        return ''
+    emit = lp[:, g.labels]                                   # (T, S)
+    delta = np.full(len(g.labels), -np.inf)
+    delta[g.start_states] = emit[0, g.start_states]
+    back = np.zeros((T, len(g.labels)), dtype=np.int32)
+    back[0] = np.arange(len(g.labels))
+    for t in range(1, T):
+        cand = delta[g.pred]                                 # (S, P)
+        arg = cand.argmax(axis=1)
+        back[t] = g.pred[np.arange(len(g.labels)), arg]
+        delta = cand[np.arange(len(g.labels)), arg] + emit[t]
+    final = g.final_states[np.argmax(delta[g.final_states])]
+    if not np.isfinite(delta[final]):
+        return greedy_decode(lp)
+    words, state = [None] * len(GRID_SLOTS), final
+    for t in range(T - 1, -1, -1):
+        slot, word = g.slot_word[state]
+        if slot >= 0:
+            words[slot] = word
+        state = back[t, state]
+    return ' '.join(w for w in words if w)
 
 
 # ------------------------------------------------------------------ error rates
