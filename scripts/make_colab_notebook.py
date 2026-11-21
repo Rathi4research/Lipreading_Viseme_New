@@ -63,6 +63,14 @@ The only cell you normally edit. Speakers are space-separated (`s1 s2 s3`).
   `RUN_NAME` per configuration to compare them.
 - **Runs:** each `RUN_NAME` gets its own folder on Drive. Re-running with the same name and `RESUME = True`
   continues from that run's `last_model.pth`.
+- **Ablation:** set `TRAINING_MODE = "ablation"` to train and evaluate several configurations one after
+  another with identical data and settings (`scripts/run_ablation.py`), each in
+  `runs/<ABLATION_NAME>/<configuration>/`, followed by a comparison table (`scripts/compare_runs.py`).
+  `ABLATION_PRESET`: `seq` (hybrid vs bilstm vs transformer vs conformer), `gate` (the proposed gate vs the
+  four baseline gates, plus the baseline and visual_only model types), `pool` (avg vs flatten), or `custom`
+  (list `model_type/seq_model/visual_pool/gate` entries in `ABLATION_CONFIGS`). `ABLATION_TRAIN_SPEAKERS`
+  (if not empty) and `ABLATION_EPOCHS` make a cheaper reduced ablation; validation/test speakers stay the same.
+  Re-running continues: finished configurations are skipped, an interrupted one resumes.
 """)
 code(r'''
 # ---- Code ----
@@ -83,6 +91,7 @@ STORED_SIZE = 96  #@param {type:"integer"}
 
 # ---- Training / evaluation ----
 RUN_TRAINING = True  #@param {type:"boolean"}
+TRAINING_MODE = "single"  #@param ["single", "ablation"]
 RUN_NAME = "v2-full-hybrid-ie"  #@param {type:"string"}
 RESUME = True  #@param {type:"boolean"}
 VAL_SPEAKERS = "s20 s22"  #@param {type:"string"}
@@ -103,6 +112,13 @@ MIN_DETECTED_RATIO = 0.5  #@param {type:"number"}
 CORRUPT_RATIO = 0.3  #@param {type:"number"}
 DEMO_SAMPLES = 3  #@param {type:"integer"}
 
+# ---- Ablation (TRAINING_MODE = "ablation") ----
+ABLATION_NAME = "ablation-seq"  #@param {type:"string"}
+ABLATION_PRESET = "seq"  #@param ["seq", "gate", "pool", "custom"]
+ABLATION_CONFIGS = "full/hybrid/avg/intrinsic-extrinsic full/bilstm/avg/intrinsic-extrinsic"  #@param {type:"string"}
+ABLATION_TRAIN_SPEAKERS = "s3 s4 s5 s6 s7 s8 s9 s10"  #@param {type:"string"}
+ABLATION_EPOCHS = 15  #@param {type:"integer"}
+
 # ---- Derived paths (no need to edit) ----
 PREPROCESS_TAG = f"{CROP_MODE}_scale{CROP_SCALE}_{STORED_SIZE}px"
 REPO_DIR = "/content/Lipreading_Viseme_New"
@@ -112,7 +128,13 @@ ALIGN_DIR = f"{LOCAL_DATA}/alignments"
 NPY_DIR = f"{LOCAL_DATA}/preprocessed_lips"
 DRIVE_PREPROCESSED = f"{OUTPUT_DIR}/preprocessed/{PREPROCESS_TAG}"
 DRIVE_ALIGNMENTS = f"{OUTPUT_DIR}/alignments"
-RUN_DIR = f"{OUTPUT_DIR}/runs/{RUN_NAME}"
+SINGLE_RUN = RUN_TRAINING and TRAINING_MODE == "single"
+ABLATION_RUN = RUN_TRAINING and TRAINING_MODE == "ablation"
+if ABLATION_RUN and ABLATION_TRAIN_SPEAKERS.strip():
+    TRAIN_SPEAKERS = ABLATION_TRAIN_SPEAKERS
+if ABLATION_RUN:
+    NUM_EPOCHS = ABLATION_EPOCHS
+RUN_DIR = f"{OUTPUT_DIR}/runs/{ABLATION_NAME if ABLATION_RUN else RUN_NAME}"
 LANDMARK_FILE = f"{REPO_DIR}/shape_predictor_68_face_landmarks.dat"
 
 split = lambda s: s.split()
@@ -121,6 +143,8 @@ MODEL_SPK = sorted(set(TRAIN_SPK + VAL_SPK + TEST_SPK), key=lambda s: int(s[1:])
 print("Preprocessing tag :", PREPROCESS_TAG)
 print("Preprocess        :", PREP_SPK if RUN_PREPROCESSING else "skipped")
 print("Train/val/test    :", (TRAIN_SPK, VAL_SPK, TEST_SPK) if RUN_TRAINING else "skipped")
+print("Training mode     :", TRAINING_MODE if RUN_TRAINING else "off",
+      f"(preset {ABLATION_PRESET}, {NUM_EPOCHS} epochs)" if ABLATION_RUN else "")
 print("Run folder        :", RUN_DIR)
 ''')
 
@@ -449,7 +473,7 @@ disconnect, just Run all again). Training augmentation (random crop, flip, time 
 `AUGMENT` is off. If the GPU runs out of memory, lower `BATCH_SIZE`. Resuming requires the same model settings.
 """)
 code(r'''
-if RUN_TRAINING:
+if SINGLE_RUN:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     with open(f"{RUN_DIR}/run_config.json", "w") as f:
         json.dump({"commit": COMMIT, "branch": BRANCH, "preprocess_tag": PREPROCESS_TAG,
@@ -468,13 +492,64 @@ if RUN_TRAINING:
         cmd += f" --resume-from {RUN_DIR}/last_model.pth"
         print("Resuming from", f"{RUN_DIR}/last_model.pth")
     run(cmd)
+elif ABLATION_RUN:
+    print("Ablation mode: see the next cell.")
 else:
     print("Training is off (set RUN_TRAINING = True in Settings).")
 ''')
 
+# --------------------------------------------------------------------------------------- ablation
+md(r"""
+## 13b. Ablation: train and evaluate every configuration (TRAINING_MODE = "ablation")
+Runs `scripts/run_ablation.py`, which trains each configuration of the chosen preset with exactly the same
+speakers, epochs, batch size, learning rate and seed, then evaluates its best checkpoint on the test speakers
+(clean, and with `CORRUPT_RATIO` of the frames corrupted). Each configuration gets its own folder under
+`runs/<ABLATION_NAME>/` with the same files as a single run. Progress lines (validation WER per epoch, test
+results) are shown here; full logs are in each folder's `run.log`.
+
+This takes roughly (number of configurations) x (time of one run). After a disconnect, Run all again: finished
+configurations are skipped and the interrupted one resumes from its `last_model.pth`.
+""")
+code(r'''
+if ABLATION_RUN:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    which = f"--preset {ABLATION_PRESET}" if ABLATION_PRESET != "custom" else f"--configs {ABLATION_CONFIGS}"
+    train_args = f"{COMMON} --num-epochs {NUM_EPOCHS} --learning-rate {LEARNING_RATE}"
+    train_args += (" --no-augment" if not AUGMENT else "") + (" --no-amp" if not AMP else "")
+    run(f"python scripts/run_ablation.py {which} --runs-dir {RUN_DIR} --corrupt-ratio {CORRUPT_RATIO} -- {train_args}")
+else:
+    print("Not in ablation mode.")
+''')
+
+# --------------------------------------------------------------------------------------- comparison
+md(r"""
+## 13c. Compare runs
+Runs `scripts/compare_runs.py` and shows one row per configuration, sorted by test word error rate with
+GRID-grammar decoding (lower is better): parameters, epochs and time, best validation WER, greedy and
+constrained WER / CER, sentence accuracy, letter and homophene-letter accuracy, the WER increase with corrupted
+frames, and the fusion gate's language weight on reliable vs unreliable frames. Saved as `comparison.csv`,
+`comparison.md` and `comparison.png` in the ablation folder - or, in single mode, in `runs/` across all single
+runs trained so far (e.g. one RUN_NAME per configuration).
+""")
+code(r'''
+import pandas as pd
+compare_dir = RUN_DIR if ABLATION_RUN else f"{OUTPUT_DIR}/runs"
+if RUN_TRAINING and os.path.isdir(compare_dir):
+    try:
+        run(f"python scripts/compare_runs.py {compare_dir}")
+        df_cmp = pd.read_csv(f"{compare_dir}/comparison.csv").set_index("run")
+        display(df_cmp.round(3))
+        from IPython.display import Image
+        display(Image(f"{compare_dir}/comparison.png", width=900))
+    except RuntimeError as e:
+        print("Nothing to compare yet:", e)
+else:
+    print("Training is off.")
+''')
+
 # --------------------------------------------------------------------------------------- curves
 md(r"""
-## 14. Training curves
+## 14. Training curves (single mode)
 Plots the per-epoch losses, the validation word / character error rates (greedy decoding) and the per-frame
 validation accuracies from `training_metrics.csv`, and saves the figure to the run folder. *Speech-only*
 accuracy excludes silence frames, which make up about half of every GRID clip.
@@ -482,7 +557,7 @@ accuracy excludes silence frames, which make up about half of every GRID clip.
 code(r'''
 import pandas as pd
 metrics_csv = f"{RUN_DIR}/training_metrics.csv"
-if RUN_TRAINING and os.path.exists(metrics_csv):
+if SINGLE_RUN and os.path.exists(metrics_csv):
     df = pd.read_csv(metrics_csv).set_index("epoch")
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17, 4.5))
     df[["train_total_loss", "val_total_loss", "train_ctc_loss", "val_ctc_loss"]].plot(ax=ax1, marker="o", title="Losses")
@@ -499,7 +574,7 @@ else:
 
 # --------------------------------------------------------------------------------------- evaluate
 md(r"""
-## 15. Evaluate the best checkpoint on the test speakers
+## 15. Evaluate the best checkpoint on the test speakers (single mode)
 Runs `main.py evaluate` on `best_model.pth` (the model settings are read from the checkpoint) and writes the
 report, JSON and confusion matrices to `runs/<RUN_NAME>/evaluation/`. It reports word / character error rate
 for greedy and GRID-grammar-constrained decoding, per-slot accuracy, the letter-slot homophene analysis
@@ -510,7 +585,7 @@ and flagged as unreliable - the controlled robustness test for the intrinsic-ext
 """)
 code(r'''
 best = f"{RUN_DIR}/best_model.pth"
-if RUN_TRAINING and os.path.exists(best):
+if SINGLE_RUN and os.path.exists(best):
     eval_dir = f"{RUN_DIR}/evaluation"
     base = (f"python main.py evaluate --data-dir {LOCAL_DATA} --test-subjects {TEST_SPEAKERS} "
             f"--batch-size {BATCH_SIZE} --num-workers {NUM_WORKERS} --checkpoint-path {best} --results-dir {eval_dir}")
@@ -538,13 +613,13 @@ else:
 
 # --------------------------------------------------------------------------------------- inference
 md(r"""
-## 16. Inference demo
+## 16. Inference demo (single mode)
 Runs `main.py inference` on a few test utterances and prints, for each, the reference sentence, the greedy and
 grammar-constrained decoded sentences, the per-frame phoneme sequence and the average visual/language fusion
 weights.
 """)
 code(r'''
-if RUN_TRAINING and os.path.exists(best):
+if SINGLE_RUN and os.path.exists(best):
     run(f"python main.py inference --data-dir {LOCAL_DATA} --test-subjects {TEST_SPEAKERS} "
         f"--checkpoint-path {best} --demo-samples {DEMO_SAMPLES} --batch-size {BATCH_SIZE}")
 else:
