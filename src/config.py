@@ -73,10 +73,12 @@ class Config:
     AMP = True                      # mixed precision; only takes effect on CUDA
     SEED = 42
 
-    # Model structure (main.py --seq-model / --visual-pool / --gate)
+    # Model structure (main.py --seq-model / --visual-pool / --gate / --lm-context)
     SEQ_MODEL = 'hybrid'            # bilstm | transformer | hybrid | conformer
     VISUAL_POOL = 'avg'             # avg (spatial average) | flatten (original, ~13M-param projection)
     GATE = 'intrinsic-extrinsic'    # ambiguity | entropy | learned | hard | intrinsic-extrinsic
+    LM_CONTEXT = 'none'             # none | draft: the language model also reads the model's own draft CTC decode
+    CONTEXT_DROPOUT = 0.3           # lm-context draft: probability of hiding a training sample's draft context
 
     # Sentence-level CTC over characters (blank = index 0)
     CTC_CHARS = " abcdefghijklmnopqrstuvwxyz"
@@ -91,6 +93,7 @@ class Config:
         'phoneme': 0.5,
         'word': 0.25,               # forced to 0 for model_type visual_only
         'fusion_reg': 0.01,         # gate-entropy regulariser (full model, soft gates)
+        'draft_ctc': 0.5,           # interim draft-CTC head (only trained with --lm-context draft)
     }
     SILENCE_LOSS_WEIGHT = 0.3       # per-frame losses: weight of silence frames (~50% of GRID frames)
 

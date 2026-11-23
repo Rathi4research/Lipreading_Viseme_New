@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.config import Config
+from src.decoding import NUM_CLASSES
 from models.sequence_model import PositionalEncoding, _run_lstm
 
 
@@ -247,6 +248,52 @@ class HierarchicalLanguageModel(nn.Module):
         return combined_features, word_probs
 
 
+class DraftContextEncoder(nn.Module):
+    """Encodes the model's own draft CTC decode (character indices) into context features.
+
+    The draft is decoded from the unfused sequence features by the interim draft-CTC head, so it
+    is self-generated at train and test time - never the ground truth. Because it summarises the
+    whole clip instead of the current frame, this context stays informative when individual frames
+    are corrupted or missing: it carries what the rest of the sentence says.
+    """
+
+    def __init__(self, num_chars=NUM_CLASSES, embed_dim=Config.HIDDEN_DIM,
+                 out_dim=Config.HIDDEN_DIM * 2, num_layers=2):
+        super().__init__()
+        self.char_embedding = nn.Embedding(num_chars, embed_dim)
+        self.pos_encoding = PositionalEncoding(embed_dim, max_len=max(Config.SEQUENCE_LENGTH, 512))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=8,
+            dim_feedforward=embed_dim,
+            dropout=Config.DROPOUT_RATE,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers,
+                                                 enable_nested_tensor=False)
+        self.out_proj = nn.Linear(embed_dim, out_dim)
+
+    def forward(self, tokens, token_lengths, target_len=None):
+        """
+        Args:
+            tokens: (B, L) long, draft character indices (BLANK padding after each clip's draft)
+            token_lengths: (B,) valid draft lengths (>= 1)
+            target_len: optional output frame count (the context is stretched to match the
+                frame sequence, like the other per-frame language-model inputs)
+        Returns context features (B, target_len or L, out_dim)
+        """
+        x = self.char_embedding(tokens)
+        x = self.pos_encoding(x.transpose(0, 1)).transpose(0, 1)
+        pad_mask = torch.arange(tokens.size(1), device=tokens.device).unsqueeze(0) \
+            >= token_lengths.unsqueeze(1)
+        feats = self.transformer(x, src_key_padding_mask=pad_mask)
+        feats = self.out_proj(feats)
+        if target_len is not None:
+            feats = time_match(feats, target_len)
+        return feats
+
+
 class ContextualLanguageModel(nn.Module):
     """Hierarchical LM with speaker adaptation.
 
@@ -254,11 +301,17 @@ class ContextualLanguageModel(nn.Module):
     training each sample's speaker id is replaced by it with probability Config.SPEAKER_DROPOUT,
     so that slot is trained and can be used for speakers not seen in training (the usual
     speaker-independent split, where val/test speakers would otherwise get untrained embeddings).
+
+    With context_dim > 0 (built only for --lm-context draft) the LM additionally receives
+    per-frame context features from the draft CTC decode, concatenated with the base and speaker
+    features before the adaptation MLP, so the language stream embodies the sentence decoded so
+    far instead of only the (possibly corrupted) current-frame phoneme estimate.
     """
 
     def __init__(self, num_speakers=Config.NUM_SPEAKERS, vocab_size=len(Config.VOCABULARY),
-                 speaker_dropout=Config.SPEAKER_DROPOUT):
+                 speaker_dropout=Config.SPEAKER_DROPOUT, context_dim=0):
         super().__init__()
+        self.context_dim = context_dim
         self.base_lm = HierarchicalLanguageModel(
             vocab_size=Config.VOCAB_SIZE,
             phoneme_vocab_size=Config.PHONEME_VOCAB_SIZE
@@ -269,28 +322,41 @@ class ContextualLanguageModel(nn.Module):
         self.speaker_embedding = nn.Embedding(num_speakers + 1, Config.HIDDEN_DIM * 2)
 
         self.context_adaptation = nn.Sequential(
-            nn.Linear(Config.HIDDEN_DIM * 4, Config.HIDDEN_DIM * 2),  # 1024 -> 512
+            nn.Linear(Config.HIDDEN_DIM * 4 + context_dim, Config.HIDDEN_DIM * 2),
             nn.ReLU(),
-            nn.Linear(Config.HIDDEN_DIM * 2, Config.HIDDEN_DIM * 2)  # 512 -> 512
+            nn.Linear(Config.HIDDEN_DIM * 2, Config.HIDDEN_DIM * 2)
         )
 
         self.classifier = nn.Linear(Config.HIDDEN_DIM * 2, vocab_size)
 
     def forward(self, phoneme_probs=None, speaker_ids=None, sequence_length=Config.SEQUENCE_LENGTH,
-                lengths=None, pad_mask=None):
+                lengths=None, pad_mask=None, context_feats=None):
         batch_size = speaker_ids.size(0) if speaker_ids is not None else None
         base_features, _ = self.base_lm(phoneme_probs=phoneme_probs, sequence_length=sequence_length,
-                                        batch_size=batch_size, lengths=lengths, pad_mask=pad_mask)
+                                         batch_size=batch_size, lengths=lengths, pad_mask=pad_mask)
+        seq_len = base_features.size(1)
 
-        if speaker_ids is not None:
+        if self.context_dim:
+            if speaker_ids is not None:
+                if self.training and self.speaker_dropout > 0:
+                    drop = torch.rand(speaker_ids.shape, device=speaker_ids.device) < self.speaker_dropout
+                    speaker_ids = speaker_ids.masked_fill(drop, self.unknown_speaker_id)
+                speaker_embeds = self.speaker_embedding(speaker_ids)
+                speaker_embeds = speaker_embeds.unsqueeze(1).expand(-1, seq_len, -1)
+            else:
+                speaker_embeds = base_features.new_zeros(base_features.size(0), seq_len,
+                                                         Config.HIDDEN_DIM * 2)
+            if context_feats is None:
+                context_feats = base_features.new_zeros(base_features.size(0), seq_len, self.context_dim)
+            context_feats = time_match(context_feats, seq_len)
+            combined = torch.cat([base_features, speaker_embeds, context_feats], dim=-1)
+            adapted_features = self.context_adaptation(combined)
+        elif speaker_ids is not None:
             if self.training and self.speaker_dropout > 0:
                 drop = torch.rand(speaker_ids.shape, device=speaker_ids.device) < self.speaker_dropout
                 speaker_ids = speaker_ids.masked_fill(drop, self.unknown_speaker_id)
-
-            speaker_embeds = self.speaker_embedding(speaker_ids)  # (B, H)
-            seq_len = base_features.size(1)
+            speaker_embeds = self.speaker_embedding(speaker_ids)
             speaker_embeds = speaker_embeds.unsqueeze(1).expand(-1, seq_len, -1)
-
             combined = torch.cat([base_features, speaker_embeds], dim=-1)  # (B, L, 1024)
             adapted_features = self.context_adaptation(combined)  # (B, L, 512)
         else:

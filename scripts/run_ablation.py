@@ -2,7 +2,8 @@
 and training settings, each in its own run folder. Re-running continues where it stopped: finished runs
 are skipped and an interrupted run resumes from its last_model.pth.
 
-A configuration is written model_type/seq_model/visual_pool/gate, e.g. full/bilstm/avg/intrinsic-extrinsic.
+A configuration is written model_type/seq_model/visual_pool/gate[/lm_context],
+e.g. full/bilstm/avg/intrinsic-extrinsic or full/conformer/avg/intrinsic-extrinsic/draft.
 Presets:
   seq    full model, intrinsic-extrinsic gate, sequence encoders hybrid | bilstm | transformer | conformer
   gate   hybrid encoder; gates intrinsic-extrinsic | ambiguity | entropy | learned | hard, plus the baseline
@@ -36,12 +37,15 @@ PRESETS = {
 
 def parse_config(spec):
     parts = spec.split('/')
-    if len(parts) != 4:
-        raise SystemExit(f"Configuration must be model_type/seq_model/visual_pool/gate, got {spec!r}")
-    model_type, seq_model, visual_pool, gate = parts
+    if len(parts) not in (4, 5):
+        raise SystemExit(f"Configuration must be model_type/seq_model/visual_pool/gate[/lm_context], got {spec!r}")
+    model_type, seq_model, visual_pool, gate = parts[:4]
+    lm_context = parts[4] if len(parts) == 5 else 'none'
     # the gate does not affect baseline / visual_only models; name them without it
     name = f"{model_type}-{seq_model}-{visual_pool}" + (f"-{gate}" if model_type == 'full' else '')
-    return name, {'model_type': model_type, 'seq_model': seq_model, 'visual_pool': visual_pool, 'gate': gate}
+    name += f"-{lm_context}" if lm_context != 'none' else ''
+    return name, {'model_type': model_type, 'seq_model': seq_model, 'visual_pool': visual_pool,
+                  'gate': gate, 'lm_context': lm_context}
 
 
 def flag_value(args, flag):
@@ -80,7 +84,8 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--preset', choices=sorted(PRESETS), help='Predefined set of configurations')
-    parser.add_argument('--configs', nargs='+', default=[], help='Configurations model_type/seq_model/visual_pool/gate')
+    parser.add_argument('--configs', nargs='+', default=[],
+                        help='Configurations model_type/seq_model/visual_pool/gate[/lm_context]')
     parser.add_argument('--runs-dir', required=True, help='Folder that receives one sub-folder per configuration')
     parser.add_argument('--corrupt-ratio', type=float, default=0.3,
                         help='Also evaluate with this share of frames corrupted (0 to skip)')
@@ -91,7 +96,7 @@ def main():
     if not specs:
         parser.error('give --preset and/or --configs')
     for bad in ('--checkpoint-dir', '--local-checkpoints', '--resume-from', '--model-type', '--seq-model',
-                '--visual-pool', '--gate'):
+                '--visual-pool', '--gate', '--lm-context'):
         if bad in train_args:
             parser.error(f"{bad} is set per configuration by this script; remove it from the pass-through arguments")
 
@@ -127,7 +132,8 @@ def main():
         else:
             cmd = [args.python, 'main.py', 'train', *train_args, '--checkpoint-dir', run_dir,
                    '--model-type', cfg['model_type'], '--seq-model', cfg['seq_model'],
-                   '--visual-pool', cfg['visual_pool'], '--gate', cfg['gate']]
+                   '--visual-pool', cfg['visual_pool'], '--gate', cfg['gate'],
+                   '--lm-context', cfg['lm_context']]
             last = os.path.join(run_dir, 'last_model.pth')
             if os.path.exists(last):
                 cmd += ['--resume-from', last]

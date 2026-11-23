@@ -19,14 +19,16 @@ kept for reference only and does not match the current code.)
    - Preprocessing: `RUN_PREPROCESSING`, `PREPROCESS_SPEAKERS` (all 33 by default), crop settings.
    - Training: `RUN_TRAINING`, `RUN_NAME` (one per configuration), speakers (default: the LipNet
      unseen-speaker split — validate s20 s22, test s1 s2, train the other 29), `MODEL_TYPE`, `SEQ_MODEL`,
-     `VISUAL_POOL`, `GATE`, epochs, batch size, learning rate, `AMP`, `SEED`, `CORRUPT_RATIO` (robustness test).
+     `VISUAL_POOL`, `GATE`, `LM_CONTEXT` (`none` | `draft`), epochs, batch size, learning rate, `AMP`,
+     `SEED`, `CORRUPT_RATIO` (robustness test).
 3. *Runtime → Run all*. After a disconnect, Run all again: finished speakers are skipped and training resumes
    from the run's `last_model.pth` (with the same model settings).
 
 ## Comparing configurations
 Train one `RUN_NAME` per configuration, e.g. the proposed gate and its baselines:
 `GATE = intrinsic-extrinsic | ambiguity | entropy | learned | hard`, plus `MODEL_TYPE = baseline` and
-`visual_only`, and the `SEQ_MODEL` ablation. Compare `test_results.json` / `evaluation/` across runs.
+`visual_only`, the `SEQ_MODEL` ablation, and `LM_CONTEXT = draft` (decoded-context language model) vs
+`none`. Compare `test_results.json` / `evaluation/` across runs.
 
 ## What ends up on Drive
 ```

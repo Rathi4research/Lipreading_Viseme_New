@@ -42,7 +42,8 @@ class LipReadingTrainer:
     grammar-constrained decoding, homophene metrics and the fusion-gate analysis.
     """
 
-    LOSS_KEYS = ('total_loss', 'ctc_loss', 'viseme_loss', 'aux_viseme_loss', 'phoneme_loss', 'word_loss', 'fusion_reg')
+    LOSS_KEYS = ('total_loss', 'ctc_loss', 'viseme_loss', 'aux_viseme_loss', 'phoneme_loss', 'word_loss',
+                 'fusion_reg', 'draft_ctc_loss')
     METRIC_FIELDS = (['epoch', 'lr', 'epoch_seconds'] + [f'train_{k}' for k in LOSS_KEYS] +
                      [f'val_{k}' for k in LOSS_KEYS] +
                      ['val_wer', 'val_cer', 'val_sentence_accuracy', 'val_viseme_accuracy', 'val_phoneme_accuracy',
@@ -269,7 +270,7 @@ class LipReadingTrainer:
         saved = checkpoint.get('model_config')
         if saved and saved != self.model.model_config:
             raise ValueError(f"Checkpoint model {saved} differs from the requested model {self.model.model_config}; "
-                             f"pass the same --model-type/--seq-model/--visual-pool/--gate to resume.")
+                             f"pass the same --model-type/--seq-model/--visual-pool/--gate/--lm-context to resume.")
         self.model.load_state_dict(upgrade_legacy_state_dict(checkpoint['model_state_dict']))
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

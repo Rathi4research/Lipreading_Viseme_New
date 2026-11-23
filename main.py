@@ -115,7 +115,7 @@ def set_seed(seed):
 
 def build_model(args):
     return ModelFactory.create(args.model_type or 'full', seq_model=args.seq_model, visual_pool=args.visual_pool,
-                               gate=args.gate)
+                               gate=args.gate, lm_context=args.lm_context)
 
 
 def train_model(args):
@@ -324,6 +324,10 @@ def main():
                         help='Spatial pooling at the end of the 3D CNN (training)')
     parser.add_argument('--gate', choices=['ambiguity', 'entropy', 'learned', 'hard', 'intrinsic-extrinsic'],
                         default=Config.GATE, help='Fusion gate for --model-type full (training)')
+    parser.add_argument('--lm-context', choices=['none', 'draft'], default=Config.LM_CONTEXT,
+                        help="Language-model context: 'draft' conditions the language model on the "
+                             "model's own draft CTC decode of the sequence features (corruption-"
+                             "resistant sentence context; training)")
     parser.add_argument('--model-type', choices=['full', 'baseline', 'visual_only'],
                         default=None,
                         help="Model variant for training (default: full). For evaluate/inference "
@@ -407,6 +411,7 @@ def main():
     Config.MIN_DETECTED_RATIO = args.min_detected_ratio
     Config.AMP = not args.no_amp
     Config.SELECT_METRIC = args.select_metric
+    Config.LM_CONTEXT = args.lm_context
     set_seed(args.seed)
     Config.set_data_dir(args.data_dir)
     if args.frame_size:

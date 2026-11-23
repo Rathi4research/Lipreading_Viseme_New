@@ -59,7 +59,10 @@ Runtime flags on `main.py` (all modes): `--device auto|cuda|mps|cpu` (auto = cud
 `--data-dir`, `--frame-size` (model input, default 88), `--no-augment`, `--num-workers` (default 2 on
 CUDA, else 0), `--max-samples-per-subject`, `--batch-size`, `--learning-rate`, `--seed`, `--no-amp`,
 `--min-detected-ratio`; model (train): `--model-type`, `--seq-model bilstm|transformer|hybrid|conformer`,
-`--visual-pool avg|flatten`, `--gate ambiguity|entropy|learned|hard|intrinsic-extrinsic`; evaluate:
+`--visual-pool avg|flatten`, `--gate ambiguity|entropy|learned|hard|intrinsic-extrinsic`,
+`--lm-context none|draft` (draft = the language model also reads the model's own greedy CTC decode
+of the sequence features, an interim draft-CTC head trained with the `draft_ctc` loss weight, so the
+language stream carries sentence-level context that survives corrupted frames); evaluate:
 `--corrupt-ratio`, `--results-dir`. Checkpoint location for `train`: `Config.CHECKPOINT_DIR` (Google Drive on Colab) by
 default, `--local-checkpoints` for `./checkpoints`, or `--checkpoint-dir PATH`. The trainer writes
 `best_model.pth`, `last_model.pth` (every epoch), `checkpoint_epoch_N.pth` (every 5),
@@ -105,8 +108,8 @@ Data flows through these stages, wired together in `VisemePhonemeAdaptiveModel`
 (`models/fusion_network.py`), the single top-level `nn.Module`. Model inputs are frames, clip lengths,
 speaker ids and the preprocessing frame-quality signals — nothing derived from the targets (phonemes,
 words, ground-truth ambiguity) may be fed in. `model.model_config` (`model_type`, `seq_model`,
-`visual_pool`, `gate`) is stored in checkpoints; resume refuses a mismatch and `load_pretrained_model`
-rebuilds the stored configuration, frame size and normalisation.
+`visual_pool`, `gate`, `lm_context`) is stored in checkpoints; resume refuses a mismatch and `load_pretrained_model`
+rebuilds the stored configuration, frame size and normalisation (checkpoints without `lm_context` load as `none`).
 
 1. **Visual encoding** (`models/visual_encoder.py`) — `LipROI` (per-frame spatial attention gate) →
    `VisualEncoder` (4-block 3D CNN, spatial-only pooling so every frame keeps its own feature) →
@@ -120,6 +123,12 @@ rebuilds the stored configuration, frame size and normalisation.
    phoneme estimate (aux viseme probs × viseme→phoneme prior). Phoneme Transformer → word BiLSTM
    (absolute frame positions) → cross-attention → speaker embedding (`model.speaker_ids_for`; unseen
    speakers use `Config.UNKNOWN_SPEAKER_ID`, trained via `Config.SPEAKER_DROPOUT`). Per-frame word logits.
+   With `--lm-context draft` an interim `draft_ctc_head` on the unfused sequence features adds its own
+   greedy CTC decode (self-generated, no labels; trained by the `draft_ctc` loss weight): `DraftContextEncoder`
+   embeds that draft sentence and the LM concatenates the per-frame context features with its base and
+   speaker features, so the language stream embodies the sentence decoded so far — evidence that stays
+   meaningful when the current frame is corrupted or missing (`Config.CONTEXT_DROPOUT` randomly hides
+   the context of training samples so the LM does not over-rely on it).
 4. **Fusion** (`src/adaptive_fusion.py`) — `full`: `MultiScaleAdaptiveFusion` (1/3/5/7-frame scales,
    scale attention) of 256-d visual and 512-d language features into 256-d fused features (no viseme
    bottleneck). Per-frame language weight from `--gate`: `ambiguity` (intrinsic ambiguity), `entropy`
@@ -131,7 +140,8 @@ rebuilds the stored configuration, frame size and normalisation.
    viseme probs × learnable P(phoneme | viseme) prior from `viseme_mapper`).
 
 Loss (`compute_loss`, weights in `Config.LOSS_WEIGHTS`): CTC + viseme + aux viseme + phoneme + word
-(not for visual_only) + gate-entropy regulariser (soft gates). Per-frame terms skip padding and frames
+(not for visual_only) + gate-entropy regulariser (soft gates) + draft CTC (`--lm-context draft` only).
+Per-frame terms skip padding and frames
 without a detected face and down-weight silence (`Config.SILENCE_LOSS_WEIGHT`). CTC runs on CPU under MPS.
 
 `src/decoding.py`: greedy CTC decoding, exact best-path (Viterbi) decoding over the GRID grammar's

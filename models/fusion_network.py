@@ -3,14 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.config import Config
-from src.decoding import NUM_CLASSES as CTC_CLASSES
+from src.decoding import NUM_CLASSES as CTC_CLASSES, batch_greedy_indices
 from models.visual_encoder import EnhancedVisualEncoder, upgrade_legacy_state_dict
 from models.sequence_model import SEQ_MODELS, build_sequence_encoder
-from src.language_model import ContextualLanguageModel
+from src.language_model import ContextualLanguageModel, DraftContextEncoder
 from src.adaptive_fusion import GATES, MultiScaleAdaptiveFusion, PriorGuidedPhonemeHead
 from src.viseme_mapping import viseme_mapper
 
 MODEL_TYPES = ('full', 'baseline', 'visual_only')
+LM_CONTEXTS = ('none', 'draft')
 SIL_VISEME = viseme_mapper.get_viseme('sil')
 SIL_PHONEME = Config.PHONEMES.index('sil')
 SIL_WORD = Config.VOCABULARY.index('sil')
@@ -38,20 +39,24 @@ class VisemePhonemeAdaptiveModel(nn.Module):
     """
 
     def __init__(self, num_visemes=12, num_phonemes=len(Config.PHONEMES), model_type='full',
-                 seq_model=None, visual_pool=None, gate=None):
+                 seq_model=None, visual_pool=None, gate=None, lm_context=None):
         super().__init__()
         seq_model = seq_model or Config.SEQ_MODEL
         visual_pool = visual_pool or Config.VISUAL_POOL
         gate = gate or Config.GATE
+        lm_context = lm_context or Config.LM_CONTEXT
         if model_type not in MODEL_TYPES:
             raise ValueError(f"model_type must be one of {MODEL_TYPES}, got {model_type!r}")
         if seq_model not in SEQ_MODELS:
             raise ValueError(f"seq_model must be one of {SEQ_MODELS}, got {seq_model!r}")
         if gate not in GATES:
             raise ValueError(f"gate must be one of {GATES}, got {gate!r}")
+        if lm_context not in LM_CONTEXTS:
+            raise ValueError(f"lm_context must be one of {LM_CONTEXTS}, got {lm_context!r}")
         self.model_type = model_type
+        self.lm_context = lm_context
         self.model_config = {'model_type': model_type, 'seq_model': seq_model,
-                             'visual_pool': visual_pool, 'gate': gate}
+                            'visual_pool': visual_pool, 'gate': gate, 'lm_context': lm_context}
         # Speakers seen in training (set by the trainer, stored in checkpoints); others use the
         # language model's "unknown speaker" embedding.
         self.known_speakers = []
@@ -63,8 +68,17 @@ class VisemePhonemeAdaptiveModel(nn.Module):
         self.sequence_model = build_sequence_encoder(seq_model, Config.VISUAL_FEATURE_DIM, H)
         self.aux_viseme_head = nn.Linear(H, num_visemes)
 
+        context_dim = 0
         if model_type in ('full', 'baseline'):
-            self.language_model = ContextualLanguageModel(num_speakers=Config.NUM_SPEAKERS)
+            if lm_context == 'draft':
+                # Interim CTC head on the unfused sequence features: its greedy decode is the
+                # self-generated sentence context the language model reads on top of the
+                # per-frame phoneme estimates.
+                self.draft_ctc_head = nn.Linear(H, CTC_CLASSES)
+                self.context_encoder = DraftContextEncoder(out_dim=Config.HIDDEN_DIM * 2)
+                context_dim = Config.HIDDEN_DIM * 2
+            self.language_model = ContextualLanguageModel(num_speakers=Config.NUM_SPEAKERS,
+                                                           context_dim=context_dim)
         if model_type == 'full':
             self.adaptive_fusion = MultiScaleAdaptiveFusion(H, H * 2, H, gate)
         elif model_type == 'baseline':
@@ -127,12 +141,22 @@ class VisemePhonemeAdaptiveModel(nn.Module):
         entropy = -(aux_viseme_probs * torch.log(aux_viseme_probs + 1e-8)).sum(-1) / torch.log(
             torch.tensor(float(self.num_visemes)))
 
+        draft_log_probs = context_feats = None
+        if getattr(self, 'draft_ctc_head', None) is not None:
+            draft_log_probs = F.log_softmax(self.draft_ctc_head(sequence_hidden).float(), dim=-1)
+            with torch.no_grad():
+                draft_tokens, draft_lengths = batch_greedy_indices(draft_log_probs, lengths)
+            context_feats = self.context_encoder(draft_tokens, draft_lengths, target_len=T)
+            if self.training and Config.CONTEXT_DROPOUT > 0:
+                keep_ctx = torch.rand(B, 1, 1, device=context_feats.device) >= Config.CONTEXT_DROPOUT
+                context_feats = context_feats * keep_ctx.to(context_feats.dtype)
+
         language_features = word_logits = None
         if self.model_type in ('full', 'baseline'):
             soft_phonemes = torch.matmul(aux_viseme_probs, self.phoneme_head.confusion_matrix)
             language_features, word_logits = self.language_model(
                 phoneme_probs=soft_phonemes, speaker_ids=speaker_ids, sequence_length=T,
-                lengths=lengths, pad_mask=pad_mask)
+                lengths=lengths, pad_mask=pad_mask, context_feats=context_feats)
 
         fusion_info = {'fusion_weights': None, 'scale_attention_weights': None}
         if self.model_type == 'full':
@@ -155,6 +179,7 @@ class VisemePhonemeAdaptiveModel(nn.Module):
             'phoneme_logits': phoneme_logits,
             'aux_viseme_logits': aux_viseme_logits.float(),
             'word_logits': None if word_logits is None else word_logits.float(),
+            'draft_log_probs': draft_log_probs,
             'lengths': lengths,
             'fusion_weights': fusion_info.get('fusion_weights'),
             'scale_attention': fusion_info.get('scale_attention_weights'),
@@ -195,6 +220,15 @@ class VisemePhonemeAdaptiveModel(nn.Module):
             targets['target_lengths'].to(ctc_device), blank=Config.CTC_BLANK, zero_infinity=True
         ).to(log_probs.device)
 
+        # Interim draft CTC (same objective as above, on the unfused sequence features; gives
+        # the draft-CTC head its gradients and is only present with --lm-context draft)
+        if predictions.get('draft_log_probs') is not None and w.get('draft_ctc', 0) > 0:
+            draft_lp = predictions['draft_log_probs'].transpose(0, 1)
+            losses['draft_ctc_loss'] = F.ctc_loss(
+                draft_lp.to(ctc_device), targets['targets'].to(ctc_device), lengths.to(ctc_device),
+                targets['target_lengths'].to(ctc_device), blank=Config.CTC_BLANK, zero_infinity=True
+            ).to(log_probs.device)
+
         visemes = targets['visemes']
         frame_ok = visemes >= 0
         if targets.get('detected') is not None:
@@ -217,7 +251,8 @@ class VisemePhonemeAdaptiveModel(nn.Module):
             losses['fusion_reg'] = reg / len(predictions['fusion_weights'])
 
         key = {'ctc_loss': 'ctc', 'viseme_loss': 'viseme', 'aux_viseme_loss': 'aux_viseme',
-               'phoneme_loss': 'phoneme', 'word_loss': 'word', 'fusion_reg': 'fusion_reg'}
+               'phoneme_loss': 'phoneme', 'word_loss': 'word', 'fusion_reg': 'fusion_reg',
+               'draft_ctc_loss': 'draft_ctc'}
         losses['total_loss'] = sum(w[key[name]] * value for name, value in losses.items())
         return losses
 
@@ -245,9 +280,9 @@ class ModelFactory:
     """Builds and loads model variants"""
 
     @staticmethod
-    def create(model_type='full', seq_model=None, visual_pool=None, gate=None):
+    def create(model_type='full', seq_model=None, visual_pool=None, gate=None, lm_context=None):
         return VisemePhonemeAdaptiveModel(model_type=model_type, seq_model=seq_model,
-                                          visual_pool=visual_pool, gate=gate)
+                                          visual_pool=visual_pool, gate=gate, lm_context=lm_context)
 
     @staticmethod
     def create_baseline_model():

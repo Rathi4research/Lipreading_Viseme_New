@@ -4,6 +4,7 @@ and word / character error rates.
 Output alphabet (Config.CTC_CHARS): index 0 is the CTC blank, then space and a-z.
 """
 import numpy as np
+import torch
 
 from src.config import Config
 
@@ -48,6 +49,33 @@ def greedy_decode(log_probs, length=None):
             out.append(int(idx))
         prev = idx
     return ' '.join(indices_to_text(out).split())  # normalise stray/double spaces
+
+
+def batch_greedy_indices(log_probs, lengths=None):
+    """Batched best-path CTC: argmax per frame, merge repeats, drop blanks, pack left.
+
+    log_probs: (B, T, C) tensor of per-frame log-probabilities (no gradients flow through
+    this helper); lengths: optional (B,) real frame counts. Token indices follow INDEX_TO_CHAR
+    (space and a-z). Returns tokens (B, T) long - the draft text of each clip followed by BLANK
+    padding - and token_lengths (B) long, at least 1 so no row is fully padded.
+    """
+    best = log_probs.detach().argmax(dim=-1)
+    B, T = best.shape
+    device = best.device
+    if lengths is not None:
+        pos = torch.arange(T, device=device).unsqueeze(0)
+        best = best.masked_fill(pos >= lengths.to(device).unsqueeze(1), BLANK)
+    tokens = torch.zeros(B, T, dtype=torch.long, device=device)
+    token_lengths = torch.zeros(B, dtype=torch.long, device=device)
+    prev = torch.zeros(B, dtype=torch.long, device=device)
+    rows = torch.arange(B, device=device)
+    for t in range(T):
+        cur = best[:, t]
+        keep = (cur != prev) & (cur != BLANK)
+        tokens[rows[keep], token_lengths[keep]] = cur[keep]
+        token_lengths = token_lengths + keep.long()
+        prev = cur
+    return tokens, token_lengths.clamp_min(1)
 
 
 # ------------------------------------------------------------------ grammar-constrained beam search

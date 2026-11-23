@@ -59,8 +59,11 @@ The only cell you normally edit. Speakers are space-separated (`s1 s2 s3`).
   preprocessed (in this or an earlier session). The default split is the unseen-speaker protocol used by
   LipNet: validate on s20 and s22, test on s1 and s2, train on the other 29 speakers.
 - **Model:** `MODEL_TYPE` (full / baseline / visual_only), `SEQ_MODEL` (temporal encoder), `VISUAL_POOL`
-  and `GATE` (fusion gate; `intrinsic-extrinsic` is the proposed one, the others are baselines). Train one
-  `RUN_NAME` per configuration to compare them.
+  and `GATE` (fusion gate; `intrinsic-extrinsic` is the proposed one, the others are baselines).
+  `LM_CONTEXT`: `draft` also conditions the language model on the model's own draft CTC decode
+  (interim CTC head), giving the fusion a sentence-level context that survives corrupted frames;
+  `none` keeps the original per-frame phoneme input only. Train one `RUN_NAME` per configuration to
+  compare them.
 - **Runs:** each `RUN_NAME` gets its own folder on Drive. Re-running with the same name and `RESUME = True`
   continues from that run's `last_model.pth`.
 - **Ablation:** set `TRAINING_MODE = "ablation"` to train and evaluate several configurations one after
@@ -68,14 +71,15 @@ The only cell you normally edit. Speakers are space-separated (`s1 s2 s3`).
   `runs/<ABLATION_NAME>/<configuration>/`, followed by a comparison table (`scripts/compare_runs.py`).
   `ABLATION_PRESET`: `seq` (hybrid vs bilstm vs transformer vs conformer), `gate` (the proposed gate vs the
   four baseline gates, plus the baseline and visual_only model types), `pool` (avg vs flatten), or `custom`
-  (list `model_type/seq_model/visual_pool/gate` entries in `ABLATION_CONFIGS`). `ABLATION_TRAIN_SPEAKERS`
+  (list `model_type/seq_model/visual_pool/gate[/lm_context]` entries in `ABLATION_CONFIGS`).
+  `ABLATION_TRAIN_SPEAKERS`
   (if not empty) and `ABLATION_EPOCHS` make a cheaper reduced ablation; validation/test speakers stay the same.
   Re-running continues: finished configurations are skipped, an interrupted one resumes.
 """)
 code(r'''
 # ---- Code ----
 REPO_URL = "https://github.com/Rathi4research/Lipreading_Viseme_New.git"  #@param {type:"string"}
-BRANCH = "training-v2"  #@param {type:"string"}
+BRANCH = "lm-decoded-context"  #@param {type:"string"}
 
 # ---- Google Drive ----
 RAW_DATA_DIR = "/content/drive/MyDrive/Training_Artifacts"  #@param {type:"string"}
@@ -101,6 +105,7 @@ MODEL_TYPE = "full"  #@param ["full", "baseline", "visual_only"]
 SEQ_MODEL = "hybrid"  #@param ["hybrid", "bilstm", "transformer", "conformer"]
 VISUAL_POOL = "avg"  #@param ["avg", "flatten"]
 GATE = "intrinsic-extrinsic"  #@param ["intrinsic-extrinsic", "ambiguity", "entropy", "learned", "hard"]
+LM_CONTEXT = "none"  #@param ["none", "draft"]
 NUM_EPOCHS = 30  #@param {type:"integer"}
 BATCH_SIZE = 16  #@param {type:"integer"}
 LEARNING_RATE = 3e-4  #@param {type:"number"}
@@ -478,11 +483,11 @@ if SINGLE_RUN:
     with open(f"{RUN_DIR}/run_config.json", "w") as f:
         json.dump({"commit": COMMIT, "branch": BRANCH, "preprocess_tag": PREPROCESS_TAG,
                    "model_type": MODEL_TYPE, "seq_model": SEQ_MODEL, "visual_pool": VISUAL_POOL, "gate": GATE,
-                   "train": TRAIN_SPK, "val": VAL_SPK, "test": TEST_SPK, "epochs": NUM_EPOCHS,
+                   "lm_context": LM_CONTEXT, "train": TRAIN_SPK, "val": VAL_SPK, "test": TEST_SPK, "epochs": NUM_EPOCHS,
                    "batch_size": BATCH_SIZE, "learning_rate": LEARNING_RATE, "augment": AUGMENT, "amp": AMP,
                    "seed": SEED}, f, indent=2)
     cmd = (f"python main.py train {COMMON} --model-type {MODEL_TYPE} --seq-model {SEQ_MODEL} "
-           f"--visual-pool {VISUAL_POOL} --gate {GATE} --num-epochs {NUM_EPOCHS} "
+           f"--visual-pool {VISUAL_POOL} --gate {GATE} --lm-context {LM_CONTEXT} --num-epochs {NUM_EPOCHS} "
            f"--learning-rate {LEARNING_RATE} --checkpoint-dir {RUN_DIR}")
     if not AUGMENT:
         cmd += " --no-augment"
