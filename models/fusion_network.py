@@ -94,6 +94,9 @@ class VisemePhonemeAdaptiveModel(nn.Module):
         if model_type == 'visual_only':
             self.loss_weights['word'] = 0.0
         self.uses_soft_gate = model_type == 'full' and gate != 'hard'
+        # Evaluation-only switches (main.py evaluate --decode-head / --drop-context); not saved
+        self.eval_decode_head = 'main'
+        self.eval_drop_context = False
 
     # ------------------------------------------------------------------ helpers
     def speaker_ids_for(self, subjects, device=None):
@@ -150,6 +153,8 @@ class VisemePhonemeAdaptiveModel(nn.Module):
             if self.training and Config.CONTEXT_DROPOUT > 0:
                 keep_ctx = torch.rand(B, 1, 1, device=context_feats.device) >= Config.CONTEXT_DROPOUT
                 context_feats = context_feats * keep_ctx.to(context_feats.dtype)
+            if self.eval_drop_context:
+                context_feats = torch.zeros_like(context_feats)
 
         language_features = word_logits = None
         if self.model_type in ('full', 'baseline'):
@@ -172,6 +177,8 @@ class VisemePhonemeAdaptiveModel(nn.Module):
         viseme_logits = self.viseme_classifier(fused)
         phoneme_logits = self.phoneme_head(fused, viseme_logits)
         ctc_log_probs = F.log_softmax(self.ctc_head(fused).float(), dim=-1)
+        if self.eval_decode_head == 'draft' and draft_log_probs is not None:
+            ctc_log_probs = draft_log_probs
 
         return {
             'ctc_log_probs': ctc_log_probs,

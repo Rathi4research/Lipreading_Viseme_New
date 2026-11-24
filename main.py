@@ -157,10 +157,18 @@ def evaluate_model(args):
                            max_samples_per_subject=args.max_samples_per_subject, corrupt_ratio=args.corrupt_ratio)
     if args.corrupt_ratio:
         logger.info(f"Controlled corruption: about {args.corrupt_ratio:.0%} of each clip's frames replaced and flagged")
+    if args.decode_head == 'draft' or args.drop_context:
+        if getattr(model, 'draft_ctc_head', None) is None:
+            raise ValueError("--decode-head draft / --drop-context need a model trained with --lm-context draft")
+        model.eval_decode_head = args.decode_head
+        model.eval_drop_context = args.drop_context
+        logger.info(f"Evaluation variant: decode head '{args.decode_head}', draft context "
+                    f"{'dropped (zeros)' if args.drop_context else 'on'}")
     evaluator = LipReadingEvaluator(model, make_loader(test_set, shuffle=False), device=Config.DEVICE)
     evaluator.evaluate_comprehensive()
 
     suffix = f"_corrupt{args.corrupt_ratio:g}" if args.corrupt_ratio else ""
+    suffix += ("_drafthead" if args.decode_head == 'draft' else "") + ("_nocontext" if args.drop_context else "")
     out_dir = args.results_dir
     evaluator.save_plots(os.path.join(out_dir, 'plots'))
     evaluator.save_json(os.path.join(out_dir, f'evaluation_results{suffix}.json'),
@@ -361,6 +369,10 @@ def main():
     parser.add_argument('--corrupt-ratio', type=float, default=0.0,
                         help='evaluate: replace about this share of each test clip\'s frames and flag them '
                              '(controlled robustness test)')
+    parser.add_argument('--decode-head', choices=['main', 'draft'], default='main',
+                        help="evaluate (--lm-context draft models): decode the main CTC head or the interim draft head")
+    parser.add_argument('--drop-context', action='store_true',
+                        help='evaluate (--lm-context draft models): replace the draft context with zeros')
     parser.add_argument('--results-dir', type=str, default='results',
                         help='evaluate: folder for the report, JSON and plots')
 
